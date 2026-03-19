@@ -6,7 +6,8 @@ const THENEWS_KEY = "GzCg1YdRg2mxy6OJ7XQgk2UNZwV9Pq7XNbDnuLKv";
 const GNEWS_KEY   = "9e1ef6ca6dd91d2708f9b476b72cdd22";
 const CORS        = "https://corsproxy.io/?url=";
 const START_CASH  = 1000;
-const REFRESH_MS  = 30000;
+const REFRESH_MS   = 10000;  // price refresh every 10s
+const DEEP_SCAN_MS = 180000; // deep market scan every 3 minutes (not spammy)
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const sleep  = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -238,9 +239,17 @@ function statEdge(market, mType) {
 function analyzeMarket(market, articles, cash) {
   const log = [];
   const mType = detectType(market.question);
+  const p = market.yesPrice;
+
+  // Hard block — never analyse extreme-priced markets for trading
+  if (p > 0.93 || p < 0.07) {
+    log.push(`BLOCKED: Price ${pct(p)} is too extreme (>93% or <7%)`);
+    log.push(`[DECISION] SKIP — market near resolution, no edge`);
+    return { action: "SKIP", conf: 0, amount: 0, edgeFrom: "blocked", mType, sent: { hits:{bull:[],bear:[]}, label:"N/A" }, stat: { action:"SKIP", reason:"Extreme price" }, log, reason: "Price too extreme to trade" };
+  }
+
   const sent = scoreSentiment(articles);
   const stat = statEdge(market, mType);
-  const p = market.yesPrice;
   const isMid = p >= 0.15 && p <= 0.85;
 
   log.push(`[${mType.toUpperCase()}] "${market.question.slice(0, 65)}"`);
@@ -497,8 +506,8 @@ export default function App() {
       await sleep(60); sys("[OK] Auto price refresh every 30s", "ok");
       await sleep(60); sys("[OK] Paper wallet: $1,000.00 USDC", "ok");
       sys("─────────────────────────────────────────", "div");
-      sys("Threshold:48%  Edge:2%+  Vol:200+  Dedup:ON", "info");
-      sys("Click SCAN or AUTO to start trading.", "info");
+      sys("Threshold:48%  PriceGuard:7%-93%  Dedup:ON", "info");
+      sys("Prices: every 10s  |  Deep scan: every 3min", "info");
       sl("Scanner ready.", "dim");
       al("AI Engine ready — keyword+statistical model.", "dim");
       sel("Position monitor ready.", "dim");
@@ -578,15 +587,17 @@ export default function App() {
 
     if (!raw.length) { sl("ERROR: Could not fetch markets — CORS proxy busy?", "err"); setStatus("idle"); return; }
 
-    // Blacklist dead markets
+    // Blacklist dead markets — aggressive: reject price extremes regardless of volume
     const bl = new Set(blackRef.current);
     let dead = 0;
     const alive = raw.filter(m => {
       if (bl.has(m.id)) return false;
-      const isExtreme  = m.yesPrice < 0.02 || m.yesPrice > 0.98;
-      const noMov      = Math.abs(m.oneDayChange || 0) < 0.002;
-      const noVol      = (m.volume24h || 0) < 200;
-      if (isExtreme && noMov && noVol) { bl.add(m.id); dead++; return false; }
+      // HARD RULE: never trade markets already at/near resolution
+      if (m.yesPrice > 0.93 || m.yesPrice < 0.07) { bl.add(m.id); dead++; return false; }
+      // Also blacklist low-volume flat markets
+      const noMov = Math.abs(m.oneDayChange || 0) < 0.002;
+      const noVol = (m.volume24h || 0) < 200;
+      if (noMov && noVol) { bl.add(m.id); dead++; return false; }
       return true;
     });
     if (dead) { setBlacklist(new Set(bl)); blackRef.current = new Set(bl); sl(`Blacklisted ${dead} dead markets (total: ${bl.size})`, "warn"); setStats(s => ({ ...s, blacklisted: bl.size })); }
@@ -605,14 +616,19 @@ export default function App() {
 
     const toAnalyze = candidates.slice(0, 8);
     setStats(s => ({ ...s, analyzed: s.analyzed + toAnalyze.length }));
+    const tradedThisScan = new Set(); // prevent double-buying in same scan cycle
 
     for (let i = 0; i < toAnalyze.length; i++) {
       const m = toAnalyze[i];
       setStatus("thinking");
 
-      // Dedup — skip if already holding
+      // Dedup — skip if already holding OR already bought this scan
+      const heldKey = m.conditionId || m.yesId;
       const held = portRef.current.positions.some(p => p.status === "OPEN" && (p.conditionId === m.conditionId || p.yesId === m.yesId));
-      if (held) { sl(`[${i+1}/8] Already holding — skip: "${m.question.slice(0,50)}"`, "dim"); continue; }
+      if (held || tradedThisScan.has(heldKey)) {
+        sl(`[${i+1}/8] Already holding — skip: "${m.question.slice(0,50)}"`, "dim");
+        continue;
+      }
 
       const tag = m.yesPrice >= 0.15 && m.yesPrice <= 0.85 ? "MID" : m.yesPrice < 0.15 ? "LOW" : "HIGH";
       sl(`[${i+1}/8] [${tag}] ${m.question.slice(0, 60)}`, "mkt");
@@ -660,6 +676,26 @@ export default function App() {
       sl(`  → ${result.action}  Conf:${result.conf}%  [${result.edgeFrom}]  ${result.reason.slice(0, 45)}`, result.action !== "SKIP" ? "tradeok" : "dim");
 
       // Execute paper trade
+      const liveYes = m.yesPrice;
+      const liveNo  = m.noPrice;
+
+      // HARD GUARDS — absolute rules, no exceptions
+      const hardBlock =
+        liveYes > 0.93 ||   // YES already near certain — no edge buying YES
+        liveYes < 0.07 ||   // YES near zero — no edge buying NO (would need to resolve)
+        (result.action === "BUY_YES" && liveYes > 0.85) ||  // Don't chase high-probability YES
+        (result.action === "BUY_NO"  && liveYes < 0.15) ||  // Don't buy NO on near-zero markets
+        (m.bestAsk && m.bestAsk > 0.93) ||  // Order book ask too high — illiquid/resolved
+        (m.bestBid && m.bestBid < 0.03);    // Order book bid near zero — no buyers
+
+      if (hardBlock) {
+        sl(`  ✗ BLOCKED: price ${pct(liveYes)} too extreme to trade safely`, "warn");
+        bl.add(m.id); setBlacklist(new Set(bl)); blackRef.current = new Set(bl);
+        sl(`  → Auto-blacklisted (extreme price)`, "warn");
+        setStats(s => ({ ...s, skipped: s.skipped + 1, blacklisted: bl.size }));
+        sl("", "blank"); await sleep(80); continue;
+      }
+
       const go = (result.action === "BUY_YES" || result.action === "BUY_NO")
         && result.conf >= 48
         && result.amount > 0
@@ -696,6 +732,7 @@ export default function App() {
         sl(`  ✓ TRADE: BUY ${side} ${dollar(result.amount)} @ ${pct(entryPrice)}  ${shares.toFixed(3)} shares`, "tradeok");
         sys(`[TRADE] BUY ${side} ${dollar(result.amount)} @ ${pct(entryPrice)} [${result.mType}] "${m.question.slice(0, 32)}"`, "trade");
         setStats(s => ({ ...s, executed: s.executed + 1, byType: { ...s.byType, [result.mType]: (s.byType[result.mType] || 0) + 1 } }));
+        tradedThisScan.add(heldKey); // prevent re-buying same market this scan
         await sleep(200);
       } else if (result.conf < 48) {
         setStats(s => ({ ...s, skipped: s.skipped + 1 }));
@@ -772,12 +809,12 @@ export default function App() {
   const toggleAuto = () => {
     if (auto) {
       setAuto(false); clearInterval(autoRef.current);
-      sys("[AUTO] Disabled", "warn");
+      sys("[AUTO] Disabled — price refresh continues every 10s", "warn");
     } else {
       setAuto(true);
-      sys("[AUTO] ON — scan every 90s | prices every 30s", "ok");
+      sys("[AUTO] ON — deep scan every 3min | prices every 10s", "ok");
       scan();
-      autoRef.current = setInterval(() => { scan(); }, 90000);
+      autoRef.current = setInterval(() => { scan(); }, DEEP_SCAN_MS);
     }
   };
 
@@ -834,7 +871,7 @@ export default function App() {
             <Box title="MARKET SCANNER" badge={`${goodMkts.length} candidates`} style={{ flex:1 }}
               actions={[
                 { label: status !== "idle" ? "RUNNING..." : "SCAN", fn: scan, dis: status !== "idle" },
-                { label: auto ? "STOP AUTO" : "AUTO 90s", fn: toggleAuto },
+                { label: auto ? "STOP AUTO" : "AUTO 3min", fn: toggleAuto },
                 { label: "REFRESH $", fn: () => refreshPrices(false), dis: open.length === 0 },
               ]}>
               <LogPanel logs={scanLog} logRef={scanLogRef} />
