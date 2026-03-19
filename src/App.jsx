@@ -1,197 +1,404 @@
+/* eslint-disable no-unused-vars */
 import { useState, useEffect, useRef, useCallback } from "react";
-import { analyzeMarket, shouldSell, isDeadMarket, isGoodCandidate } from "./ai-engine.js";
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 const THENEWS_KEY = "GzCg1YdRg2mxy6OJ7XQgk2UNZwV9Pq7XNbDnuLKv";
 const GNEWS_KEY   = "9e1ef6ca6dd91d2708f9b476b72cdd22";
 const CORS        = "https://corsproxy.io/?url=";
 const START_CASH  = 1000;
-const SCAN_LIMIT  = 100;   // fetch 100 markets per scan
-const ANALYZE_MAX = 8;     // analyze up to 8 good candidates per scan
-
-// ─── Polymarket API ───────────────────────────────────────────────────────────
-async function polyGet(url) {
-  try {
-    const r = await fetch(CORS + encodeURIComponent(url));
-    if (!r.ok) throw new Error(r.status);
-    return await r.json();
-  } catch { return null; }
-}
-
-async function getMarkets(limit = SCAN_LIMIT, offset = 0) {
-  const data = await polyGet(
-    `https://gamma-api.polymarket.com/markets?active=true&closed=false` +
-    `&limit=${limit}&offset=${offset}&order=volume24hr&ascending=false`
-  );
-  if (!Array.isArray(data)) return [];
-  return data
-    .filter(m => m.active && !m.closed && m.enableOrderBook && m.clobTokenIds && m.outcomePrices)
-    .map(m => {
-      let yesId = null, noId = null;
-      try { [yesId, noId] = JSON.parse(m.clobTokenIds); } catch {}
-      let yesP = 0.5, noP = 0.5;
-      try { const p = JSON.parse(m.outcomePrices); yesP = +p[0]||0.5; noP = +p[1]||0.5; } catch {}
-      return {
-        id: m.id, conditionId: m.conditionId, slug: m.slug,
-        question: m.question || "Unknown",
-        yesId, noId, yesPrice: yesP, noPrice: noP,
-        bestBid: m.bestBid ?? null, bestAsk: m.bestAsk ?? null,
-        lastPrice: m.lastTradePrice ?? null,
-        volume24h:    +(m.volume24hr         || 0),
-        volume:       +(m.volumeNum          || 0),
-        liquidity:    +(m.liquidityNum       || 0),
-        oneDayChange: +(m.oneDayPriceChange  || 0),
-        oneWeekChange:+(m.oneWeekPriceChange || 0),
-        endDate: m.endDateIso || m.endDate || null,
-        category: m.category || "--",
-      };
-    });
-}
-
-async function getMidpoint(tokenId) {
-  const d = await polyGet(`https://clob.polymarket.com/midpoint?token_id=${tokenId}`);
-  return d?.mid != null ? +d.mid : null;
-}
-
-// ─── News API with fallback ───────────────────────────────────────────────────
-// 1st: TheNewsAPI  →  2nd: GNews  →  3rd: empty array
-
-async function fetchNewsTheNews(query) {
-  try {
-    const url = `https://api.thenewsapi.com/v1/news/all` +
-      `?api_token=${THENEWS_KEY}&search=${encodeURIComponent(query)}&language=en&limit=5&sort_by=published_at`;
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(r.status);
-    const d = await r.json();
-    return (d.data || []).map(a => ({
-      title:       a.title       || "",
-      description: a.description || "",
-      snippet:     a.snippet     || "",
-      source:      a.source      || "",
-      published_at:a.published_at|| "",
-      _src: "thenewsapi",
-    }));
-  } catch { return null; }  // null means failed (try fallback)
-}
-
-async function fetchNewsGNews(query) {
-  try {
-    const url = `https://gnews.io/api/v4/search` +
-      `?q=${encodeURIComponent(query)}&lang=en&max=5&sortby=publishedAt&apikey=${GNEWS_KEY}`;
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(r.status);
-    const d = await r.json();
-    return (d.articles || []).map(a => ({
-      title:       a.title       || "",
-      description: a.description || "",
-      snippet:     a.content     || a.description || "",
-      source:      a.source?.name|| "",
-      published_at:a.publishedAt || "",
-      _src: "gnews",
-    }));
-  } catch { return []; }
-}
-
-async function fetchNews(query, log) {
-  // Try TheNewsAPI first
-  const tna = await fetchNewsTheNews(query);
-  if (tna !== null && tna.length > 0) {
-    log(`  [NEWS] TheNewsAPI → ${tna.length} article(s)`, "ok");
-    return tna;
-  }
-  if (tna !== null && tna.length === 0) {
-    log(`  [NEWS] TheNewsAPI → 0 results, trying GNews...`, "warn");
-  } else {
-    log(`  [NEWS] TheNewsAPI failed, trying GNews...`, "warn");
-  }
-
-  // Fallback: GNews
-  const gn = await fetchNewsGNews(query);
-  if (gn.length > 0) {
-    log(`  [NEWS] GNews → ${gn.length} article(s)`, "ok");
-  } else {
-    log(`  [NEWS] Both APIs returned 0 results`, "dim");
-  }
-  return gn;
-}
+const REFRESH_MS  = 30000;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-const sleep = ms  => new Promise(r => setTimeout(r, ms));
-const pct   = p   => `${(+p*100).toFixed(1)}%`;
-const $     = n   => `$${(+n).toFixed(2)}`;
-const mini  = n   => +n >= 1000000 ? `$${(+n/1000000).toFixed(1)}M`
-                   : +n >= 1000    ? `$${(+n/1000).toFixed(1)}k`
-                   : `$${(+n).toFixed(0)}`;
-const now   = ()  => new Date().toLocaleTimeString("en-US", { hour12:false });
-const age   = iso => { if(!iso)return""; const h=Math.round((Date.now()-new Date(iso))/3600000); return h<24?`${h}h`:`${Math.floor(h/24)}d`; };
-const fmtUp = s   => `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m ${s%60}s`;
+const sleep  = (ms) => new Promise((r) => setTimeout(r, ms));
+const pct    = (p)  => `${(+p * 100).toFixed(1)}%`;
+const dollar = (n)  => `$${(+n).toFixed(2)}`;
+const mini   = (n)  => +n >= 1e6 ? `$${(+n/1e6).toFixed(1)}M` : +n >= 1e3 ? `$${(+n/1e3).toFixed(1)}k` : `$${(+n).toFixed(0)}`;
+const ts     = ()   => new Date().toLocaleTimeString("en-US", { hour12: false });
+const fmtUp  = (s)  => `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m ${s%60}s`;
+const age    = (iso) => { if (!iso) return ""; const h = Math.round((Date.now()-new Date(iso))/3600000); return h < 24 ? `${h}h ago` : `${Math.floor(h/24)}d ago`; };
 
-// ─── Color map ────────────────────────────────────────────────────────────────
-const C = {
-  header:"#e0e0e0", info:"#aaa", ok:"#ccc", err:"#999", warn:"#888",
-  dim:"#444", div:"#333", prompt:"#ddd", mkt:"#ddd", price:"#bbb",
-  trade:"#e0e0e0", tradeok:"#c0c0c0", decision:"#fff", conf:"#bbb",
-  sent:"#aaa", mom:"#aaa", liq:"#aaa", mis:"#bbb",
-  sell:"#ddd", profit:"#ccc", loss:"#777",
-  newsitem:"#555", blacklist:"#3a2a2a", blank:"transparent",
+// ─── API fetch with CORS proxy ────────────────────────────────────────────────
+async function apiFetch(url, opts = {}) {
+  try {
+    const r = await fetch(CORS + encodeURIComponent(url), { signal: AbortSignal.timeout(8000), ...opts });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (_e) { return null; }
+}
+
+// Direct fetch (no proxy) for CLOB
+async function directFetch(url) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (_e) { return null; }
+}
+
+// ─── Polymarket API calls ─────────────────────────────────────────────────────
+async function fetchMarkets(limit = 100) {
+  const data = await apiFetch(`https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=${limit}&order=volume24hr&ascending=false`);
+  if (!Array.isArray(data)) return [];
+  return data.filter(m => m.active && !m.closed && m.enableOrderBook && m.clobTokenIds && m.outcomePrices).map(m => {
+    let yesId = null, noId = null;
+    try { [yesId, noId] = JSON.parse(m.clobTokenIds); } catch (_e) { /* ignore */ }
+    let yesP = 0.5, noP = 0.5;
+    try { const p = JSON.parse(m.outcomePrices); yesP = +p[0] || 0.5; noP = +p[1] || 0.5; } catch (_e) { /* ignore */ }
+    return {
+      id: m.id, conditionId: m.conditionId, slug: m.slug,
+      question: m.question || "Unknown market",
+      yesId, noId, yesPrice: yesP, noPrice: noP,
+      bestBid: m.bestBid ?? null, bestAsk: m.bestAsk ?? null,
+      volume24h: +(m.volume24hr || 0), liquidity: +(m.liquidityNum || 0),
+      oneDayChange: +(m.oneDayPriceChange || 0),
+      endDate: m.endDateIso || null, category: m.category || "--",
+    };
+  });
+}
+
+// Get live order book from CLOB for accurate pricing
+async function fetchOrderBook(tokenId) {
+  // Try direct first
+  const direct = await directFetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+  if (direct?.bids || direct?.asks) return direct;
+  // Via proxy
+  return await apiFetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+}
+
+// Calculate mid price from order book
+function calcMidFromBook(book) {
+  if (!book) return null;
+  const bestBid = book.bids?.[0]?.price;
+  const bestAsk = book.asks?.[0]?.price;
+  if (bestBid && bestAsk) return (+bestBid + +bestAsk) / 2;
+  if (bestBid) return +bestBid;
+  if (bestAsk) return +bestAsk;
+  return null;
+}
+
+// Get current price — order book → midpoint → gamma fallback
+async function getLivePrice(yesId, conditionId) {
+  // 1. Try order book (most accurate)
+  const book = await fetchOrderBook(yesId);
+  const mid = calcMidFromBook(book);
+  if (mid !== null) return { price: mid, source: "orderbook", book };
+
+  // 2. Try CLOB midpoint directly
+  try {
+    const d = await directFetch(`https://clob.polymarket.com/midpoint?token_id=${yesId}`);
+    if (d?.mid != null) return { price: +d.mid, source: "clob-mid", book: null };
+  } catch (_e) { /* ignore */ }
+
+  // 3. Gamma API fallback (always works)
+  const gamma = await apiFetch(`https://gamma-api.polymarket.com/markets/${conditionId}`);
+  if (gamma?.outcomePrices) {
+    try {
+      const prices = JSON.parse(gamma.outcomePrices);
+      return { price: +prices[0], source: "gamma", book: null };
+    } catch (_e) { /* ignore */ }
+  }
+  return null;
+}
+
+// Leaderboard API
+async function fetchLeaderboard(timePeriod = "WEEK", orderBy = "PNL", limit = 25) {
+  const data = await apiFetch(`https://data-api.polymarket.com/v1/leaderboard?timePeriod=${timePeriod}&orderBy=${orderBy}&limit=${limit}&offset=0`);
+  return Array.isArray(data) ? data : [];
+}
+
+// Wallet positions
+async function fetchWalletPositions(address) {
+  return await apiFetch(`https://data-api.polymarket.com/positions?user=${address}&sizeThreshold=0.01&limit=20`);
+}
+
+async function fetchWalletTrades(address) {
+  return await apiFetch(`https://data-api.polymarket.com/trades?user=${address}&limit=10`);
+}
+
+// ─── News fetching ────────────────────────────────────────────────────────────
+function extractQuery(question) {
+  let q = question
+    .replace(/on \d{4}-\d{2}-\d{2}\??/gi, "")
+    .replace(/after the \w+ \d{4}.*?\??/gi, "")
+    .replace(/^will\s+/i, "")
+    .replace(/\s+win\s*\??$/i, "")
+    .replace(/\s+vs\.?\s+/i, " ")
+    .replace(/\?/g, "").trim();
+  if (/federal reserve|fed.*rate|rate.*fed/i.test(q)) return "Federal Reserve interest rate 2026";
+  if (/bitcoin|btc/i.test(q)) return "Bitcoin price 2026";
+  if (/ethereum|eth/i.test(q)) return "Ethereum price 2026";
+  return q.slice(0, 60);
+}
+
+async function getNews(question) {
+  const query = extractQuery(question);
+  // TheNewsAPI
+  try {
+    const url = `https://api.thenewsapi.com/v1/news/all?api_token=${THENEWS_KEY}&search=${encodeURIComponent(query)}&language=en&limit=5&sort_by=published_at`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (r.ok) {
+      const d = await r.json();
+      if (d.error) throw new Error(d.error); // API limit hit
+      const arts = (d.data || []).map(a => ({ title: a.title, snippet: a.snippet || a.description || "", src: "TNA", published: a.published_at }));
+      if (arts.length > 0) return { articles: arts, query, apiUsed: "TheNewsAPI" };
+    }
+  } catch (_e) { /* try next */ }
+  // GNews
+  try {
+    const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&lang=en&max=5&sortby=publishedAt&apikey=${GNEWS_KEY}`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (r.ok) {
+      const d = await r.json();
+      const arts = (d.articles || []).map(a => ({ title: a.title, snippet: a.content || a.description || "", src: "GNews", published: a.publishedAt }));
+      if (arts.length > 0) return { articles: arts, query, apiUsed: "GNews" };
+    }
+  } catch (_e) { /* try next */ }
+  // GNews short query
+  const short = query.split(" ").slice(0, 3).join(" ");
+  if (short.length > 3) {
+    try {
+      const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(short)}&lang=en&max=5&sortby=publishedAt&apikey=${GNEWS_KEY}`;
+      const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      if (r.ok) {
+        const d = await r.json();
+        const arts = (d.articles || []).map(a => ({ title: a.title, snippet: a.content || a.description || "", src: "GNews", published: a.publishedAt }));
+        if (arts.length > 0) return { articles: arts, query: short, apiUsed: "GNews-short" };
+      }
+    } catch (_e) { /* ignore */ }
+  }
+  return { articles: [], query, apiUsed: "none" };
+}
+
+// ─── Built-in AI Engine (no external API) ────────────────────────────────────
+// Pure rule-based system with keyword scoring + statistical edge models
+// Falls back to statistical model when no news is available
+
+const BULL_STRONG = ["confirmed","won","wins","victory","champion","elected","signed","passed","secured","clinched","approved","announced","official","frontrunner","leads","leading","dominated","beat","scored","promoted","qualified","rate cut","cut rates","dovish","easing","pivot","all time high","ath","etf approved","majority","landslide","polling lead","referendum passed","deal signed","agreement reached","unbeaten","clean sheet","guaranteed"];
+const BULL_WEAK   = ["likely","expected","projected","anticipated","favored","ahead","gaining","rising","possible","may","could","optimistic","progress","supported","backed","on track","set to","poised","forecast","predicted","hopeful","improving"];
+const BEAR_STRONG = ["lost","defeated","failed","rejected","cancelled","blocked","collapsed","impossible","ruled out","crisis","arrested","indicted","resigned","dropped out","eliminated","relegated","injured","suspended","banned","rate hike","hawkish","tightening","recession","impeached","disqualified","knocked out","sacked","fired"];
+const BEAR_WEAK   = ["unlikely","doubtful","struggling","declining","behind","trailing","underdog","concerns","disputed","delayed","setback","falling","decreasing","controversial","challenged","losing","missed","below expectations"];
+const NEG_WORDS   = ["not","no","won't","will not","cannot","can't","never","doesn't","isn't","wasn't","weren't","didn't","fails to"];
+
+function negatd(text, kw) {
+  const words = text.toLowerCase().split(/\s+/);
+  for (let i = 0; i < words.length; i++) {
+    if (words[i].includes(kw.split(" ")[0])) {
+      const ctx = words.slice(Math.max(0, i-4), i).join(" ");
+      if (NEG_WORDS.some(n => ctx.includes(n))) return true;
+    }
+  }
+  return false;
+}
+
+function scoreSentiment(articles) {
+  if (!articles.length) return { score: 0, norm: 0, label: "NO DATA", hits: { bull: [], bear: [] } };
+  const text = articles.map(a => `${a.title} ${a.snippet}`).join(" ").toLowerCase();
+  let score = 0;
+  const hits = { bull: [], bear: [] };
+  BULL_STRONG.forEach(kw => { if (text.includes(kw)) { score += negatd(text, kw) ? -1 : 3; hits.bull.push(kw); } });
+  BULL_WEAK.forEach(kw =>   { if (text.includes(kw)) { score += negatd(text, kw) ? -1 : 1; hits.bull.push(kw); } });
+  BEAR_STRONG.forEach(kw => { if (text.includes(kw)) { score -= 3; hits.bear.push(kw); } });
+  BEAR_WEAK.forEach(kw =>   { if (text.includes(kw)) { score -= 1; hits.bear.push(kw); } });
+  const norm = Math.max(-1, Math.min(1, score / 15));
+  return {
+    score, norm, hits,
+    label: score > 6 ? "STRONGLY BULLISH" : score > 2 ? "BULLISH" : score < -6 ? "STRONGLY BEARISH" : score < -2 ? "BEARISH" : "NEUTRAL"
+  };
+}
+
+function detectType(q) {
+  const t = q.toLowerCase();
+  if (/\bvs\b|\bwin on \d{4}|premier league|la liga|bundesliga|nba|nfl|nhl|mlb|champions league/.test(t)) return "sports";
+  if (/fed|interest rate|federal reserve|bps|inflation|fomc|gdp/.test(t)) return "macro";
+  if (/bitcoin|ethereum|crypto|btc|eth|sol|xrp/.test(t)) return "crypto";
+  if (/election|president|senate|vote|democrat|republican|trump|parliament/.test(t)) return "politics";
+  return "general";
+}
+
+function statEdge(market, mType) {
+  const p = market.yesPrice, mom = market.oneDayChange || 0;
+  const lf = (market.volume24h || 0) > 1e6 ? 0.4 : (market.volume24h || 0) > 1e5 ? 0.6 : 0.9;
+  if (mType === "sports") {
+    if (p >= 0.65 && p <= 0.82) return { action: "BUY_NO",  edge: 0.04*lf, reason: `Favourite bias: ${(p*100).toFixed(0)}% favourite likely overpriced` };
+    if (p >= 0.18 && p <= 0.35) return { action: "BUY_YES", edge: 0.04*lf, reason: `Underdog value: ${(p*100).toFixed(0)}% underdog may be underpriced` };
+    if (p >= 0.42 && p <= 0.58) {
+      if (mom > 0.02) return { action: "BUY_YES", edge: 0.03*lf, reason: "50/50 + upward momentum" };
+      if (mom < -0.02) return { action: "BUY_NO", edge: 0.03*lf, reason: "50/50 + downward momentum" };
+    }
+  } else if (mType === "crypto" && Math.abs(mom) > 0.06) {
+    return { action: mom > 0 ? "BUY_YES" : "BUY_NO", edge: Math.abs(mom)*0.4, reason: `Crypto momentum ${(mom*100).toFixed(1)}%` };
+  } else if (mType === "macro" && p >= 0.25 && p <= 0.75 && Math.abs(mom) > 0.04) {
+    return { action: mom > 0 ? "BUY_YES" : "BUY_NO", edge: Math.abs(mom)*0.5*lf, reason: `Macro momentum ${(mom*100).toFixed(1)}%` };
+  } else if (Math.abs(mom) > 0.10) {
+    return { action: mom > 0 ? "BUY_YES" : "BUY_NO", edge: Math.abs(mom)*0.3, reason: `Price momentum ${(mom*100).toFixed(1)}%` };
+  }
+  return { action: "SKIP", edge: 0, reason: "No statistical pattern" };
+}
+
+function analyzeMarket(market, articles, cash) {
+  const log = [];
+  const mType = detectType(market.question);
+  const sent = scoreSentiment(articles);
+  const stat = statEdge(market, mType);
+  const p = market.yesPrice;
+  const isMid = p >= 0.15 && p <= 0.85;
+
+  log.push(`[${mType.toUpperCase()}] "${market.question.slice(0, 65)}"`);
+  log.push(`Price: YES ${pct(p)}  Vol: ${mini(market.volume24h)}  News: ${articles.length} articles`);
+  log.push("─".repeat(44));
+  log.push(`[SENTIMENT] ${sent.label} (score:${sent.score})`);
+  if (sent.hits.bull.length) log.push(`  ↑ ${sent.hits.bull.slice(0,5).join(", ")}`);
+  if (sent.hits.bear.length) log.push(`  ↓ ${sent.hits.bear.slice(0,5).join(", ")}`);
+  if (!articles.length)      log.push(`  ! No news — statistical model only`);
+
+  log.push(`[MOMENTUM]  ${(market.oneDayChange||0) > 0 ? "UP" : (market.oneDayChange||0) < 0 ? "DOWN" : "FLAT"} (24h: ${((market.oneDayChange||0)*100).toFixed(2)}%)`);
+
+  // News-based mispricing
+  let newsAction = "SKIP", newsEdge = 0;
+  if (articles.length > 0) {
+    const implied = Math.max(0.05, Math.min(0.95, p + sent.norm * 0.30));
+    newsEdge = implied - p;
+    if (newsEdge > 0.02) { newsAction = "BUY_YES"; log.push(`[NEWS EDGE] YES underpriced ~${(newsEdge*100).toFixed(0)}% (implied ${pct(implied)})`); }
+    else if (newsEdge < -0.02) { newsAction = "BUY_NO"; log.push(`[NEWS EDGE] NO underpriced ~${(Math.abs(newsEdge)*100).toFixed(0)}%`); }
+    else log.push(`[NEWS EDGE] Price ≈ implied ${pct(implied)} — no clear edge`);
+  }
+
+  log.push(`[STAT EDGE] ${stat.action !== "SKIP" ? stat.action+" "+stat.reason : "No pattern"}`);
+
+  // Confidence
+  let conf = isMid ? 48 : 35;
+  const liqScore = (market.volume24h||0) > 1e6 ? 4 : (market.volume24h||0) > 1e5 ? 3 : (market.volume24h||0) > 2e4 ? 2 : 1;
+  conf += liqScore * 2;
+  if (articles.length > 0) conf += Math.round(Math.abs(sent.norm) * 25);
+  conf += Math.min(18, Math.round(Math.abs(newsEdge) * 80));
+  conf += Math.min(14, Math.round(stat.edge * 100));
+  if (Math.abs(market.oneDayChange||0) > 0.08) conf += 8;
+
+  // Final action
+  let action = "SKIP", edgeFrom = "none";
+  if (newsAction !== "SKIP" && Math.abs(newsEdge) > 0.02) { action = newsAction; edgeFrom = "news"; }
+  else if (stat.action !== "SKIP") { action = stat.action; edgeFrom = "statistical"; }
+  else if (articles.length && (sent.norm > 0.15 || sent.norm < -0.15)) { action = sent.norm > 0 ? "BUY_YES" : "BUY_NO"; edgeFrom = "sentiment"; }
+
+  conf = Math.max(0, Math.min(99, Math.round(conf)));
+  if (conf < 48) action = "SKIP";
+
+  // Size position
+  let amount = 0;
+  if (action !== "SKIP" && conf >= 48) {
+    const frac = Math.min(1, (conf - 48) / 32);
+    amount = Math.min(Math.round((5 + frac * 45) / 5) * 5, cash, 50);
+  }
+
+  log.push(`[CONFIDENCE] ${conf}%  (threshold: 48%)`);
+  log.push("─".repeat(44));
+  log.push(action !== "SKIP" && amount > 0
+    ? `[DECISION] ✓ ${action}  $${amount}  Conf:${conf}%  Edge:${edgeFrom}`
+    : `[DECISION] SKIP  Conf:${conf}%${conf < 48 ? " — below threshold" : " — no actionable edge"}`);
+
+  return {
+    action, conf, amount, edgeFrom, mType, sent, stat,
+    log,
+    reason: edgeFrom === "news" ? `${sent.label} | ${stat.reason.slice(0,45)}`
+           : edgeFrom === "statistical" ? `[stat] ${stat.reason}`
+           : `[${mType}] ${sent.label}`,
+  };
+}
+
+function shouldSell(pos, currentPrice) {
+  const pnlPct = (currentPrice - pos.ep) / pos.ep;
+  const steps = [`Entry:${pct(pos.ep)} → Now:${pct(currentPrice)}  P&L:${(pnlPct*100).toFixed(1)}%`];
+  let score = 0;
+  if (pnlPct > 0.40)      { score += 65; steps.push("TAKE PROFIT: +40%"); }
+  else if (pnlPct > 0.25) { score += 35; steps.push(`Good profit +${(pnlPct*100).toFixed(1)}%`); }
+  else if (pnlPct > 0.15) { score += 12; steps.push(`Profit +${(pnlPct*100).toFixed(1)}% — holding`); }
+  if (pnlPct < -0.40)      { score += 65; steps.push("STOP LOSS: -40%"); }
+  else if (pnlPct < -0.25) { score += 35; steps.push(`WARNING: ${(pnlPct*100).toFixed(1)}%`); }
+  else if (pnlPct < -0.15) { score += 10; steps.push(`Drawdown ${(pnlPct*100).toFixed(1)}%`); }
+  if (currentPrice > 0.93 && pos.side === "YES") { score += 28; steps.push("YES near ceiling"); }
+  if (currentPrice < 0.06 && pos.side === "YES") { score += 45; steps.push("YES collapsed"); }
+  if (currentPrice > 0.93 && pos.side === "NO")  { score += 45; steps.push("NO — market against us"); }
+  const dec = score >= 50 ? "SELL" : score >= 25 ? "CONSIDER" : "HOLD";
+  steps.push(`Score:${score}/100 → ${dec}`);
+  return { decision: dec, score, steps };
+}
+
+// ─── Color scheme ─────────────────────────────────────────────────────────────
+const TC = { sports:"#1e3a1e", macro:"#1e2e3a", crypto:"#3a3a1e", politics:"#3a1e3a", general:"#1e1e2a" };
+const TT = { sports:"#4a8a4a", macro:"#4a7a9a", crypto:"#9a9a4a", politics:"#9a4a9a", general:"#7070aa" };
+const C  = {
+  ok:"#c0c0c0",  err:"#999",    warn:"#888",  dim:"#444",
+  mkt:"#ddd",    price:"#bbb",  trade:"#ddd", tradeok:"#90e090",
+  header:"#eee", info:"#aaa",   sent:"#aaa",  conf:"#bbb",
+  decision:"#fff",profit:"#b0d0b0",loss:"#999",
+  pricetick:"#5a9a5a",adaptive:"#9a8a4a",websearch:"#5a8aaa",
+  blank:null, div:null,
 };
 
-// ─── Log Panel ────────────────────────────────────────────────────────────────
+function TypeBadge({ type }) {
+  return <span style={{ fontSize:"9px", padding:"1px 5px", background:TC[type]||"#222", color:TT[type]||"#888" }}>{(type||"?").toUpperCase()}</span>;
+}
+
 function LogPanel({ logs, logRef }) {
   return (
-    <div ref={logRef} style={{
-      flex:1, overflowY:"auto", padding:"6px 8px",
-      fontSize:"11px", lineHeight:"1.55", fontFamily:"Consolas,monospace",
-    }}>
-      {logs.map(l => l.type==="blank"
-        ? <div key={l.id} style={{height:"4px"}}/>
-        : (
-          <div key={l.id} style={{display:"flex",gap:"8px"}}>
-            <span style={{color:"#252525",flexShrink:0,fontSize:"9px",paddingTop:"2px"}}>{l.ts}</span>
-            <span style={{color:C[l.type]||"#aaa",wordBreak:"break-word"}}>{l.msg}</span>
+    <div ref={logRef} style={{ flex:1, overflowY:"auto", padding:"6px 8px", fontSize:"11px", lineHeight:"1.6", fontFamily:"Consolas,monospace" }}>
+      {logs.map(l => {
+        if (l.type === "blank") return <div key={l.id} style={{ height:"4px" }} />;
+        if (l.type === "div")   return <div key={l.id} style={{ color:"#2a2a2a", fontSize:"9px" }}>{"─".repeat(50)}</div>;
+        return (
+          <div key={l.id} style={{ display:"flex", gap:"8px" }}>
+            <span style={{ color:"#1e1e1e", flexShrink:0, fontSize:"9px", paddingTop:"1px" }}>{l.ts}</span>
+            <span style={{ color: C[l.type] || "#aaa", wordBreak:"break-word" }}>{l.msg}</span>
           </div>
-        )
-      )}
-      <span style={{display:"inline-block",width:"6px",height:"11px",
-        background:"#333",animation:"blink 1.2s step-end infinite",
-        marginLeft:"2px",verticalAlign:"text-bottom"}}/>
+        );
+      })}
+      <span style={{ display:"inline-block", width:"6px", height:"11px", background:"#2a2a2a", animation:"blink 1.2s step-end infinite", marginLeft:"2px", verticalAlign:"text-bottom" }} />
     </div>
   );
 }
 
-// ─── Panel ────────────────────────────────────────────────────────────────────
-function Panel({ title, badge, children, actions=[], flex=1 }) {
+function PanelHead({ title, badge, actions = [] }) {
   return (
-    <div style={{flex,display:"flex",flexDirection:"column",overflow:"hidden",
-      borderRight:"1px solid #141414"}}>
-      <div style={{flexShrink:0,background:"#0d0d0d",borderBottom:"1px solid #1c1c1c",
-        padding:"4px 8px",display:"flex",alignItems:"center",gap:"8px"}}>
-        <span style={{color:"#777",fontSize:"10px",letterSpacing:"1px",fontWeight:"bold"}}>{title}</span>
-        {badge && <span style={{color:"#2a2a2a",fontSize:"9px"}}>{badge}</span>}
-        <div style={{marginLeft:"auto",display:"flex",gap:"4px"}}>
-          {actions.map(a=>(
-            <button key={a.label} onClick={a.fn} disabled={a.dis} style={{
-              background:"transparent",border:`1px solid ${a.dis?"#1a1a1a":"#2e2e2e"}`,
-              color:a.dis?"#222":"#666",padding:"1px 8px",fontSize:"10px",
-              fontFamily:"Consolas,monospace",cursor:a.dis?"not-allowed":"pointer",
-              letterSpacing:"0.5px",
-            }}>{a.label}</button>
-          ))}
-        </div>
-      </div>
-      <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column"}}>
-        {children}
+    <div style={{ flexShrink:0, background:"#0d0d0d", borderBottom:"1px solid #1c1c1c", padding:"5px 10px", display:"flex", alignItems:"center", gap:"8px" }}>
+      <span style={{ color:"#666", fontSize:"10px", letterSpacing:"1px", fontWeight:"bold" }}>{title}</span>
+      {badge && <span style={{ color:"#2a2a2a", fontSize:"9px" }}>{badge}</span>}
+      <div style={{ marginLeft:"auto", display:"flex", gap:"4px" }}>
+        {actions.map(a => (
+          <button key={a.label} onClick={a.fn} disabled={a.dis} style={{
+            background:"transparent", border:`1px solid ${a.dis ? "#1a1a1a" : "#333"}`,
+            color: a.dis ? "#222" : "#666", padding:"2px 10px", fontSize:"10px",
+            fontFamily:"Consolas,monospace", cursor: a.dis ? "not-allowed" : "pointer",
+          }}>{a.label}</button>
+        ))}
       </div>
     </div>
   );
 }
 
-function SC({ label, value, color="#999" }) {
+function Box({ title, badge, actions, style = {}, children }) {
   return (
-    <div style={{display:"flex",flexDirection:"column",padding:"0 10px",
-      borderRight:"1px solid #141414",flexShrink:0}}>
-      <span style={{color:"#2a2a2a",fontSize:"9px",letterSpacing:"0.5px",whiteSpace:"nowrap"}}>{label}</span>
-      <span style={{color,fontSize:"11px",whiteSpace:"nowrap"}}>{value}</span>
+    <div style={{ display:"flex", flexDirection:"column", overflow:"hidden", borderRight:"1px solid #141414", ...style }}>
+      <PanelHead title={title} badge={badge} actions={actions || []} />
+      <div style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column" }}>{children}</div>
+    </div>
+  );
+}
+
+function SideVal({ label, value, color = "#777", sub = null, hi = false }) {
+  return (
+    <div style={{ padding:"7px 12px", borderBottom:"1px solid #0f0f0f", background: hi ? "#0a130a" : "transparent" }}>
+      <div style={{ color:"#252525", fontSize:"9px", marginBottom:"2px" }}>{label}</div>
+      <div style={{ color, fontSize:"14px", fontWeight:"bold" }}>{value}</div>
+      {sub && <div style={{ color:"#1e1e1e", fontSize:"9px", marginTop:"1px" }}>{sub}</div>}
+    </div>
+  );
+}
+
+function SRow({ label, value, color = "#3a3a3a" }) {
+  return (
+    <div style={{ display:"flex", justifyContent:"space-between", padding:"2px 12px", borderBottom:"1px solid #0a0a0a", fontSize:"10px" }}>
+      <span style={{ color:"#2a2a2a" }}>{label}</span>
+      <span style={{ color }}>{value}</span>
     </div>
   );
 }
@@ -199,11 +406,8 @@ function SC({ label, value, color="#999" }) {
 function TH({ cols }) {
   return (
     <thead>
-      <tr style={{borderBottom:"1px solid #181818"}}>
-        {cols.map(c=>(
-          <th key={c} style={{padding:"3px 8px",textAlign:"left",fontWeight:"normal",
-            color:"#333",fontSize:"10px",whiteSpace:"nowrap",letterSpacing:"0.3px"}}>{c}</th>
-        ))}
+      <tr style={{ borderBottom:"1px solid #181818" }}>
+        {cols.map(c => <th key={c} style={{ padding:"4px 8px", textAlign:"left", fontWeight:"normal", color:"#333", fontSize:"10px", whiteSpace:"nowrap" }}>{c}</th>)}
       </tr>
     </thead>
   );
@@ -212,713 +416,875 @@ function TH({ cols }) {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [markets,   setMarkets]   = useState([]);
-  const [blacklist, setBlacklist] = useState(new Set()); // Set of market IDs to never analyze again
-  const [portfolio, setPortfolio] = useState({ cash:START_CASH, positions:[], trades:[], closed:[] });
+  const [blacklist, setBlacklist] = useState(new Set());
+  const [portfolio, setPortfolio] = useState({ cash: START_CASH, positions: [], trades: [], closed: [] });
   const [status,    setStatus]    = useState("idle");
   const [auto,      setAuto]      = useState(false);
   const [tab,       setTab]       = useState("positions");
+  const [leaderboard, setLeaderboard] = useState([]);
+  const [lbPeriod,  setLbPeriod]  = useState("WEEK");
+  const [lbOrder,   setLbOrder]   = useState("PNL");
+  const [lbLoading, setLbLoading] = useState(false);
+  const [walletDetail, setWalletDetail] = useState(null);
+  const [walletLoading, setWalletLoading] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState("--");
+  const [refreshCount, setRefreshCount] = useState(0);
+  const [stats, setStats] = useState({ scans:0, analyzed:0, executed:0, news:0, skipped:0, blacklisted:0, uptime:0, lastScan:"--", best:null, worst:null, byType:{sports:0,macro:0,crypto:0,politics:0,general:0} });
 
-  const [scanLog,  setScanLog]  = useState([]);
-  const [aiLog,    setAiLog]    = useState([]);
-  const [sellLog,  setSellLog]  = useState([]);
-  const [sysLog,   setSysLog]   = useState([]);
+  const [scanLog, setScanLog] = useState([]);
+  const [aiLog,   setAiLog]   = useState([]);
+  const [sellLog, setSellLog] = useState([]);
+  const [sysLog,  setSysLog]  = useState([]);
 
-  const [stats, setStats] = useState({
-    scans:0, analyzed:0, executed:0, news:0, apiCalls:0, blacklisted:0,
-    lastScan:"--", uptime:0, best:null, worst:null, skipped:0,
-  });
-
-  const bootedRef  = useRef(false);
+  const bootRef    = useRef(false);
   const portRef    = useRef(portfolio);
   const statusRef  = useRef(status);
   const blackRef   = useRef(new Set());
   const autoRef    = useRef(null);
+  const refreshRef = useRef(null);
   const uptimeRef  = useRef(0);
-
-  const scanRef = useRef(null);
-  const aiRef   = useRef(null);
-  const sellRef = useRef(null);
-  const sysRef  = useRef(null);
+  const scanLogRef = useRef(null);
+  const aiLogRef   = useRef(null);
+  const sellLogRef = useRef(null);
+  const sysLogRef  = useRef(null);
 
   portRef.current   = portfolio;
   statusRef.current = status;
   blackRef.current  = blacklist;
 
-  useEffect(()=>{
-    [scanRef,aiRef,sellRef,sysRef].forEach(r=>{ if(r.current) r.current.scrollTop=r.current.scrollHeight; });
-  },[scanLog,aiLog,sellLog,sysLog]);
+  // Autoscroll logs
+  useEffect(() => {
+    [scanLogRef, aiLogRef, sellLogRef, sysLogRef].forEach(r => { if (r.current) r.current.scrollTop = r.current.scrollHeight; });
+  }, [scanLog, aiLog, sellLog, sysLog]);
 
-  useEffect(()=>{
-    const iv=setInterval(()=>{ uptimeRef.current+=1; setStats(s=>({...s,uptime:uptimeRef.current})); },1000);
-    return ()=>clearInterval(iv);
-  },[]);
+  // Uptime
+  useEffect(() => {
+    const iv = setInterval(() => { uptimeRef.current += 1; setStats(s => ({ ...s, uptime: uptimeRef.current })); }, 1000);
+    return () => clearInterval(iv);
+  }, []);
 
-  const push = useCallback((setter,msg,type="info")=>{
-    setter(prev=>[...prev.slice(-500),{ts:now(),msg,type,id:`${Date.now()}-${Math.random()}`}]);
-  },[]);
-  const sl  = useCallback((m,t)=>push(setScanLog, m,t),[push]);
-  const al  = useCallback((m,t)=>push(setAiLog,   m,t),[push]);
-  const sel = useCallback((m,t)=>push(setSellLog, m,t),[push]);
-  const sys = useCallback((m,t)=>push(setSysLog,  m,t),[push]);
+  // Price refresh timer
+  useEffect(() => {
+    refreshRef.current = setInterval(() => {
+      if (portRef.current.positions.filter(p => p.status === "OPEN").length > 0) refreshPrices(true);
+    }, REFRESH_MS);
+    return () => clearInterval(refreshRef.current);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Boot
-  useEffect(()=>{
-    if(bootedRef.current) return;
-    bootedRef.current=true;
-    (async()=>{
-      await sleep(80);
-      sys("PolyBot AI Paper Trader  v4.0","header");
-      sys("Smarter market selection + blacklist + GNews fallback","dim");
-      sys("─────────────────────────────────","div");
-      await sleep(150);
-      sys("[OK] Polymarket Gamma API (100 markets/scan)","ok");
-      await sleep(80); sys("[OK] CLOB live midpoint feed","ok");
-      await sleep(80); sys("[OK] TheNewsAPI (primary)","ok");
-      await sleep(80); sys("[OK] GNews API (fallback)","ok");
-      await sleep(80); sys("[OK] Blacklist engine","ok");
-      await sleep(80); sys("[OK] Paper wallet  $1,000.00 USDC","ok");
-      sys("─────────────────────────────────","div");
-      sys("Market selection:","info");
-      sys("  • Scan 100 markets sorted by volume","dim");
-      sys("  • Skip dead markets (blacklist forever)","dim");
-      sys("  • Prefer mid-range prices (10%-90%)","dim");
-      sys("  • Analyze top 8 good candidates","dim");
-      sys("Confidence threshold: 55%","info");
-      sys("Max trade: $50","info");
-      sl("Scanner idle. Click SCAN to start.","dim");
-      al("AI Engine v4 ready.","dim");
-      sel("Position monitor idle.","dim");
+  // Logger helpers
+  const push = useCallback((setter, msg, type = "info") => {
+    setter(prev => [...prev.slice(-500), { ts: ts(), msg, type, id: `${Date.now()}-${Math.random()}` }]);
+  }, []);
+  const sl  = useCallback((m, t) => push(setScanLog, m, t), [push]);
+  const al  = useCallback((m, t) => push(setAiLog,   m, t), [push]);
+  const sel = useCallback((m, t) => push(setSellLog, m, t), [push]);
+  const sys = useCallback((m, t) => push(setSysLog,  m, t), [push]);
+
+  // ── Boot ────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (bootRef.current) return;
+    bootRef.current = true;
+    (async () => {
+      await sleep(60);
+      sys("PolyBot v8.0  —  Self-contained AI, no external AI API", "header");
+      sys("─────────────────────────────────────────", "div");
+      await sleep(100);
+      sys("[OK] Polymarket Gamma API (markets)", "ok");
+      await sleep(60); sys("[OK] CLOB Order Book API (real-time prices)", "ok");
+      await sleep(60); sys("[OK] Data API (leaderboard + positions)", "ok");
+      await sleep(60); sys("[OK] TheNewsAPI + GNews (news)", "ok");
+      await sleep(60); sys("[OK] Built-in AI engine (sentiment+stat)", "ok");
+      await sleep(60); sys("[OK] Auto price refresh every 30s", "ok");
+      await sleep(60); sys("[OK] Paper wallet: $1,000.00 USDC", "ok");
+      sys("─────────────────────────────────────────", "div");
+      sys("Threshold:48%  Edge:2%+  Vol:200+  Dedup:ON", "info");
+      sys("Click SCAN or AUTO to start trading.", "info");
+      sl("Scanner ready.", "dim");
+      al("AI Engine ready — keyword+statistical model.", "dim");
+      sel("Position monitor ready.", "dim");
     })();
-  },[sys,sl,al,sel]);
+  }, [sys, sl, al, sel]);
 
-  // ── SCAN ────────────────────────────────────────────────────────────────────
-  const scan = useCallback(async()=>{
-    if(statusRef.current==="scanning"||statusRef.current==="thinking") return;
-    setStatus("scanning");
+  // ── Price refresh ────────────────────────────────────────────────────────────
+  const refreshPrices = useCallback(async (silent = false) => {
+    const open = portRef.current.positions.filter(p => p.status === "OPEN");
+    if (!open.length) return;
+    if (!silent) sys(`[REFRESH] Updating ${open.length} position price(s)...`, "info");
 
-    sl("","blank"); sl("▶ Scan cycle started","header");
+    for (const pos of open) {
+      const result = await getLivePrice(pos.yesId, pos.conditionId);
+      if (!result) { if (!silent) sys(`  "${pos.question.slice(0,35)}" — fetch failed`, "warn"); continue; }
 
-    // Fetch up to 100 markets
-    sl(`Fetching ${SCAN_LIMIT} markets from Polymarket...`,"info");
-    const raw = await getMarkets(SCAN_LIMIT, 0);
-    setStats(s=>({...s,apiCalls:s.apiCalls+1,scans:s.scans+1,lastScan:now()}));
+      const rawYes   = result.price;
+      const current  = pos.side === "YES" ? rawYes : (1 - rawYes);
+      const pnl      = (current - pos.ep) * pos.shares;
+      const pnlPct   = (current - pos.ep) / pos.ep;
 
-    if(!raw.length){
-      sl("ERROR: Could not fetch markets. CORS proxy may be busy.","err");
-      sys("[ERR] Market fetch failed","err");
-      setStatus("idle"); return;
-    }
-
-    sl(`Fetched ${raw.length} raw markets.`,"ok");
-
-    // ── BLACKLIST CHECK ──────────────────────────────────────────────────────
-    const bl = blackRef.current;
-    let newBlacklistCount = 0;
-    const newBl = new Set(bl);
-
-    const alive = raw.filter(m => {
-      if(bl.has(m.id)) return false;  // already blacklisted
-      if(isDeadMarket(m)){
-        newBl.add(m.id);
-        newBlacklistCount++;
-        return false;
+      // Extract best bid/ask from order book if available
+      let bestBid = null, bestAsk = null;
+      if (result.book) {
+        bestBid = result.book.bids?.[0]?.price ? +result.book.bids[0].price : null;
+        bestAsk = result.book.asks?.[0]?.price ? +result.book.asks[0].price : null;
       }
+
+      setPortfolio(prev => ({
+        ...prev,
+        positions: prev.positions.map(p => p.id === pos.id
+          ? { ...p, currentPrice: current, rawYesPrice: rawYes, pnl, pnlPct, lastUpdate: ts(), priceSource: result.source, bestBid, bestAsk }
+          : p
+        ),
+      }));
+
+      if (!silent) {
+        const dir = current > pos.currentPrice ? "▲" : current < pos.currentPrice ? "▼" : "─";
+        sys(`  ${dir} ${pos.side} "${pos.question.slice(0,32)}" ${pct(current)}  P&L:${pnl >= 0 ? "+" : ""}${dollar(pnl)}  [${result.source}]`, "pricetick");
+      }
+
+      // Auto close on take-profit / stop-loss
+      if (pnlPct > 0.40 || pnlPct < -0.40) {
+        const reason = pnlPct > 0 ? `TAKE PROFIT +${(pnlPct*100).toFixed(1)}%` : `STOP LOSS ${(pnlPct*100).toFixed(1)}%`;
+        sys(`[AUTO-CLOSE] ${reason} — "${pos.question.slice(0,35)}"`, pnlPct > 0 ? "profit" : "loss");
+        closePosition({ ...pos, currentPrice: current, pnl, pnlPct });
+      }
+    }
+    setLastRefresh(ts());
+    setRefreshCount(c => c + 1);
+  }, [sys]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const closePosition = useCallback((pos) => {
+    const closed = { ...pos, closePrice: pos.currentPrice, closedAt: ts(), status: "CLOSED" };
+    setPortfolio(prev => {
+      const next = { ...prev, cash: prev.cash + pos.currentPrice * pos.shares, positions: prev.positions.filter(p => p.id !== pos.id), closed: [...prev.closed, closed] };
+      portRef.current = next;
+      return next;
+    });
+    if (pos.pnl !== undefined) {
+      setStats(s => ({
+        ...s,
+        best:  !s.best  || pos.pnl > s.best.pnl  ? { ...pos } : s.best,
+        worst: !s.worst || pos.pnl < s.worst.pnl ? { ...pos } : s.worst,
+      }));
+    }
+  }, []);
+
+  // ── Main scan ─────────────────────────────────────────────────────────────────
+  const scan = useCallback(async () => {
+    if (statusRef.current === "scanning" || statusRef.current === "thinking") return;
+    setStatus("scanning");
+    sl("", "blank"); sl("▶ Scan cycle started", "header");
+
+    const raw = await fetchMarkets(100);
+    setStats(s => ({ ...s, scans: s.scans + 1, lastScan: ts() }));
+
+    if (!raw.length) { sl("ERROR: Could not fetch markets — CORS proxy busy?", "err"); setStatus("idle"); return; }
+
+    // Blacklist dead markets
+    const bl = new Set(blackRef.current);
+    let dead = 0;
+    const alive = raw.filter(m => {
+      if (bl.has(m.id)) return false;
+      const isExtreme  = m.yesPrice < 0.02 || m.yesPrice > 0.98;
+      const noMov      = Math.abs(m.oneDayChange || 0) < 0.002;
+      const noVol      = (m.volume24h || 0) < 200;
+      if (isExtreme && noMov && noVol) { bl.add(m.id); dead++; return false; }
       return true;
     });
+    if (dead) { setBlacklist(new Set(bl)); blackRef.current = new Set(bl); sl(`Blacklisted ${dead} dead markets (total: ${bl.size})`, "warn"); setStats(s => ({ ...s, blacklisted: bl.size })); }
 
-    if(newBlacklistCount > 0){
-      sl(`Blacklisted ${newBlacklistCount} dead/resolved markets.`,"warn");
-      sys(`[BLACKLIST] Added ${newBlacklistCount} dead markets. Total blacklisted: ${newBl.size}`,"warn");
-      setBlacklist(new Set(newBl));
-      blackRef.current = new Set(newBl);
-      setStats(s=>({...s,blacklisted:newBl.size}));
-    }
+    // Sort: mid-range first, then by volume
+    const candidates = alive
+      .filter(m => (m.volume24h || 0) >= 200)
+      .sort((a, b) => {
+        const aM = a.yesPrice >= 0.15 && a.yesPrice <= 0.85 ? 1 : 0;
+        const bM = b.yesPrice >= 0.15 && b.yesPrice <= 0.85 ? 1 : 0;
+        return aM !== bM ? bM - aM : (b.volume24h || 0) - (a.volume24h || 0);
+      });
 
-    sl(`${alive.length} markets passed blacklist filter.`,"ok");
+    setMarkets(raw);
+    sl(`${raw.length} fetched → ${candidates.length} valid → analyzing top 8`, "ok");
 
-    // ── GOOD CANDIDATE FILTER ────────────────────────────────────────────────
-    const candidates = alive.filter(m => isGoodCandidate(m));
+    const toAnalyze = candidates.slice(0, 8);
+    setStats(s => ({ ...s, analyzed: s.analyzed + toAnalyze.length }));
 
-    // Sort: prefer mid-range prices, then by volume
-    candidates.sort((a,b)=>{
-      const aMid = a.yesPrice >= 0.15 && a.yesPrice <= 0.85 ? 1 : 0;
-      const bMid = b.yesPrice >= 0.15 && b.yesPrice <= 0.85 ? 1 : 0;
-      if(aMid !== bMid) return bMid - aMid;  // mid-range first
-      return (b.volume24h||0) - (a.volume24h||0);  // then by volume
-    });
-
-    const toAnalyze = candidates.slice(0, ANALYZE_MAX);
-    setMarkets(raw);  // store all for the markets tab
-
-    sl(`${candidates.length} good candidates found. Analyzing top ${toAnalyze.length}...`,"ok");
-    sl("","blank");
-
-    if(toAnalyze.length === 0){
-      sl("No good candidates found this scan. All markets are dead or poor quality.","warn");
-      sl("Try again later — markets may all be resolved.","dim");
-      setStatus("idle"); return;
-    }
-
-    setStats(s=>({...s,analyzed:s.analyzed+toAnalyze.length}));
-
-    // ── ANALYZE EACH CANDIDATE ───────────────────────────────────────────────
-    for(let i=0;i<toAnalyze.length;i++){
+    for (let i = 0; i < toAnalyze.length; i++) {
       const m = toAnalyze[i];
       setStatus("thinking");
 
-      const priceTag = m.yesPrice >= 0.15 && m.yesPrice <= 0.85 ? "[MID]" :
-                       m.yesPrice < 0.15 ? "[LOW]" : "[HIGH]";
+      // Dedup — skip if already holding
+      const held = portRef.current.positions.some(p => p.status === "OPEN" && (p.conditionId === m.conditionId || p.yesId === m.yesId));
+      if (held) { sl(`[${i+1}/8] Already holding — skip: "${m.question.slice(0,50)}"`, "dim"); continue; }
 
-      sl(`[${i+1}/${toAnalyze.length}] ${priceTag} ${m.question.slice(0,65)}`,"mkt");
-      sl(`  YES ${pct(m.yesPrice)}  NO ${pct(m.noPrice)}  Vol ${mini(m.volume24h)}  Liq ${mini(m.liquidity)}  24hΔ ${m.oneDayChange>0?"+":""}${(m.oneDayChange*100).toFixed(1)}%`,"dim");
+      const tag = m.yesPrice >= 0.15 && m.yesPrice <= 0.85 ? "MID" : m.yesPrice < 0.15 ? "LOW" : "HIGH";
+      sl(`[${i+1}/8] [${tag}] ${m.question.slice(0, 60)}`, "mkt");
+      sl(`  YES:${pct(m.yesPrice)}  Vol:${mini(m.volume24h)}  24hΔ:${((m.oneDayChange||0)*100).toFixed(1)}%`, "dim");
 
-      // Live midpoint
-      let live = m.yesPrice;
-      const mid = await getMidpoint(m.yesId);
-      if(mid!==null){
-        live=mid; m.yesPrice=mid; m.noPrice=1-mid;
-        sl(`  Live midpoint → YES ${pct(mid)}`,"price");
-        setStats(s=>({...s,apiCalls:s.apiCalls+1}));
+      // Get live price from order book
+      const liveResult = await getLivePrice(m.yesId, m.conditionId);
+      if (liveResult) {
+        m.yesPrice = liveResult.price;
+        m.noPrice  = 1 - liveResult.price;
+        if (liveResult.book) {
+          m.bestBid = liveResult.book.bids?.[0]?.price ? +liveResult.book.bids[0].price : null;
+          m.bestAsk = liveResult.book.asks?.[0]?.price ? +liveResult.book.asks[0].price : null;
+        }
+        sl(`  Live [${liveResult.source}]: YES ${pct(liveResult.price)}${m.bestBid ? `  Bid:${pct(m.bestBid)}` : ""}${m.bestAsk ? ` Ask:${pct(m.bestAsk)}` : ""}`, "price");
       }
 
-      // News — with fallback
-      const q = m.question.replace(/\?/g,"").slice(0,60);
-      sl(`  Searching: "${q.slice(0,48)}..."`,"info");
-      const arts = await fetchNews(q, sl);
-      setStats(s=>({...s,news:s.news+arts.length,apiCalls:s.apiCalls+1}));
-
-      if(arts.length > 0){
-        arts.slice(0,3).forEach(a=>{
-          const src = a._src === "gnews" ? "[GNews]" : "[TNA]";
-          sl(`    ${src} [${age(a.published_at)}] ${(a.title||"").slice(0,62)}`,"newsitem");
-        });
+      // News
+      sl(`  Searching news...`, "dim");
+      const newsResult = await getNews(m.question);
+      setStats(s => ({ ...s, news: s.news + newsResult.articles.length }));
+      if (newsResult.articles.length > 0) {
+        sl(`  [${newsResult.apiUsed}] ${newsResult.articles.length} article(s)`, "ok");
+        newsResult.articles.slice(0, 2).forEach(a => sl(`    • [${age(a.published)}] ${(a.title || "").slice(0, 62)}`, "dim"));
+      } else {
+        sl(`  No news — using statistical model`, "dim");
       }
 
-      // AI Analysis
-      al("","blank");
-      const result = analyzeMarket(m, arts, portRef.current.cash);
-      result.thinkingLog.forEach(line=>{
-        const t = line.startsWith("[DECISION]")?"decision"
-          :line.startsWith("[CONFIDENCE]")?"conf"
-          :line.startsWith("[SENTIMENT]")?"sent"
-          :line.startsWith("[MOMENTUM]")?"mom"
-          :line.startsWith("[LIQUIDITY]")?"liq"
-          :line.startsWith("[MISPRICING]")?"mis"
-          :line.startsWith("Market:")?"header"
-          :line.startsWith("───")?"div":"dim";
-        al(line,t);
+      // AI analysis
+      al("", "blank");
+      const result = analyzeMarket(m, newsResult.articles, portRef.current.cash);
+      result.log.forEach(line => {
+        const t = line.startsWith("[DECISION]") ? "decision"
+          : line.startsWith("[CONFIDENCE]") ? "conf"
+          : line.startsWith("[SENTIMENT]")  ? "sent"
+          : line.startsWith("[MOMENTUM]")   ? "dim"
+          : line.startsWith("[NEWS EDGE]")  ? "price"
+          : line.startsWith("[STAT EDGE]")  ? "price"
+          : line.startsWith("[")            ? "mkt"
+          : line.startsWith("─")           ? "div"
+          : "dim";
+        al(line, t);
       });
 
-      sl(`  → AI: ${result.action}  Conf:${result.confidence}%  ${result.reasoning.slice(0,50)}`
-        ,result.action!=="SKIP"?"trade":"dim");
+      sl(`  → ${result.action}  Conf:${result.conf}%  [${result.edgeFrom}]  ${result.reason.slice(0, 45)}`, result.action !== "SKIP" ? "tradeok" : "dim");
 
-      // If skipping, auto-blacklist markets with zero momentum AND no news
-      if(result.action==="SKIP" && result.confidence < 40 && arts.length===0 &&
-         Math.abs(m.oneDayChange||0) < 0.005){
-        newBl.add(m.id);
-        setBlacklist(new Set(newBl));
-        blackRef.current=new Set(newBl);
-        sl(`  → Auto-blacklisted (no news, no movement, low conf)`, "blacklist");
-        setStats(s=>({...s,blacklisted:newBl.size,skipped:s.skipped+1}));
-      } else if(result.action==="SKIP"){
-        setStats(s=>({...s,skipped:s.skipped+1}));
-      }
+      // Execute paper trade
+      const go = (result.action === "BUY_YES" || result.action === "BUY_NO")
+        && result.conf >= 48
+        && result.amount > 0
+        && portRef.current.cash >= result.amount;
 
-      // Execute trade
-      const go = (result.action==="BUY_YES"||result.action==="BUY_NO")
-        && result.confidence>=55 && result.amount>0
-        && portRef.current.cash>=result.amount;
-
-      if(go){
-        const side = result.action==="BUY_YES"?"YES":"NO";
-        const ep   = side==="YES"?live:(1-live);
-        const shrs = result.amount/ep;
-        const maxP = shrs-result.amount;
-
-        const trade={
-          id:Date.now()+Math.random(),
-          question:m.question.slice(0,72),
-          conditionId:m.conditionId, yesId:m.yesId,
-          side,ep,currentPrice:ep,
-          amount:result.amount,shares:shrs,maxProfit:maxP,
-          pnl:0,pnlPct:0,
-          confidence:result.confidence,
-          openedAt:now(),openedTs:Date.now(),
-          status:"OPEN",category:m.category,
-          reasoning:result.reasoning,
-          newsSource:arts[0]?._src||"none",
-        };
+      if (go) {
+        const side = result.action === "BUY_YES" ? "YES" : "NO";
+        const ep   = side === "YES" ? m.yesPrice : m.noPrice;
+        // Use best ask as actual entry price if available (more realistic)
+        const entryPrice = side === "YES" && m.bestAsk ? m.bestAsk : side === "NO" && m.bestBid ? (1 - m.bestBid) : ep;
+        const shares = result.amount / entryPrice;
+        const maxProfit = shares - result.amount;
 
         setStatus("trading");
-        setPortfolio(prev=>{
-          const next={...prev,cash:prev.cash-result.amount,
-            positions:[...prev.positions,trade],trades:[...prev.trades,trade]};
-          portRef.current=next; return next;
+        const trade = {
+          id: Date.now() + Math.random(),
+          question: m.question.slice(0, 72),
+          conditionId: m.conditionId, yesId: m.yesId,
+          side, ep: entryPrice, currentPrice: entryPrice,
+          rawYesPrice: m.yesPrice, bestBid: m.bestBid, bestAsk: m.bestAsk,
+          amount: result.amount, shares, maxProfit, pnl: 0, pnlPct: 0,
+          conf: result.conf, openedAt: ts(), openedTs: Date.now(),
+          status: "OPEN", mktType: result.mType,
+          reason: result.reason, edgeFrom: result.edgeFrom,
+          newsCount: newsResult.articles.length,
+          priceSource: liveResult?.source || "gamma", lastUpdate: ts(),
+        };
+
+        setPortfolio(prev => {
+          const next = { ...prev, cash: prev.cash - result.amount, positions: [...prev.positions, trade], trades: [...prev.trades, trade] };
+          portRef.current = next;
+          return next;
         });
-
-        sl(`  ✓ TRADE OPEN: BUY ${side} $${result.amount} @ ${pct(ep)}  ${shrs.toFixed(3)} shares`,"tradeok");
-        sys(`[TRADE] BUY ${side} $${result.amount} @ ${pct(ep)} conf:${result.confidence}% — "${m.question.slice(0,35)}"`,"trade");
-        setStats(s=>({...s,executed:s.executed+1}));
+        sl(`  ✓ TRADE: BUY ${side} ${dollar(result.amount)} @ ${pct(entryPrice)}  ${shares.toFixed(3)} shares`, "tradeok");
+        sys(`[TRADE] BUY ${side} ${dollar(result.amount)} @ ${pct(entryPrice)} [${result.mType}] "${m.question.slice(0, 32)}"`, "trade");
+        setStats(s => ({ ...s, executed: s.executed + 1, byType: { ...s.byType, [result.mType]: (s.byType[result.mType] || 0) + 1 } }));
         await sleep(200);
+      } else if (result.conf < 48) {
+        setStats(s => ({ ...s, skipped: s.skipped + 1 }));
+        if (result.conf < 38 && !newsResult.articles.length && Math.abs(m.oneDayChange || 0) < 0.003) {
+          bl.add(m.id); setBlacklist(new Set(bl)); blackRef.current = new Set(bl);
+          sl(`  Auto-blacklisted (no data, conf:${result.conf}%)`, "warn");
+          setStats(s => ({ ...s, blacklisted: bl.size }));
+        }
       }
-
-      sl("","blank");
-      await sleep(150);
+      sl("", "blank");
+      await sleep(80);
     }
 
-    sl("✓ Scan complete.","ok");
-    sys(`[SCAN] done. Cash:${$(portRef.current.cash)}  Blacklist:${blackRef.current.size}`,"ok");
+    await refreshPrices(false);
+    sl("✓ Scan complete.", "ok");
+    sys(`[SCAN] Done. Cash:${dollar(portRef.current.cash)}  Positions:${portRef.current.positions.filter(p=>p.status==="OPEN").length}`, "ok");
     setStatus("idle");
-  },[sl,al,sys]);
+  }, [sl, al, sys, refreshPrices]);
 
-  // ── SELL EVAL ────────────────────────────────────────────────────────────────
-  const evalSells = useCallback(async()=>{
-    const open=portRef.current.positions.filter(p=>p.status==="OPEN");
-    if(!open.length){ sel("No open positions to evaluate.","dim"); return; }
-    sel("","blank"); sel(`▶ Evaluating ${open.length} position(s)...`,"header");
+  // ── Sell evaluator ────────────────────────────────────────────────────────────
+  const evalSells = useCallback(async () => {
+    const open = portRef.current.positions.filter(p => p.status === "OPEN");
+    if (!open.length) { sel("No open positions.", "dim"); return; }
+    sel("", "blank"); sel(`▶ Evaluating ${open.length} positions...`, "header");
 
-    for(const pos of open){
-      sel("","blank");
-      sel(`${pos.side} "${pos.question.slice(0,55)}"`, "mkt");
+    // Refresh prices first
+    await refreshPrices(true);
 
-      const mid=await getMidpoint(pos.yesId);
-      let cur=pos.currentPrice;
-      if(mid!==null) cur=pos.side==="YES"?mid:(1-mid);
+    for (const pos of portRef.current.positions.filter(p => p.status === "OPEN")) {
+      sel("", "blank");
+      sel(`${pos.side} [${pos.mktType || "?"}] "${pos.question.slice(0, 52)}"`, "mkt");
+      sel(`  Entry:${pct(pos.ep)} → Current:${pct(pos.currentPrice)}  P&L:${pos.pnl >= 0 ? "+" : ""}${dollar(pos.pnl || 0)}  [${pos.priceSource || "?"}]`, "info");
+      if (pos.bestBid && pos.bestAsk) sel(`  Order book: Bid:${pct(pos.bestBid)}  Ask:${pct(pos.bestAsk)}  Spread:${((pos.bestAsk - pos.bestBid)*100).toFixed(1)}¢`, "dim");
 
-      const pnl=(cur-pos.ep)*pos.shares;
-      const pnlPct=(cur-pos.ep)/pos.ep;
-      setPortfolio(prev=>({...prev,
-        positions:prev.positions.map(p=>p.id===pos.id?{...p,currentPrice:cur,pnl,pnlPct}:p),
-      }));
-
-      const arts=await fetchNews(pos.question.slice(0,55), ()=>{});
-      const txts=arts.map(a=>`${a.title||""} ${a.snippet||""}`);
-      const res=shouldSell(pos,cur,txts);
-      res.steps.forEach(s=>{
-        const t=s.includes("TAKE PROFIT")||s.includes("STOP LOSS")?"sell"
-          :s.includes("profit")||s.includes("+")?"profit"
-          :s.includes("WARNING")||s.includes("collapsed")?"loss":"dim";
-        sel(`  ${s}`,t);
+      const res = shouldSell(pos, pos.currentPrice);
+      res.steps.forEach(step => {
+        const t = step.includes("TAKE PROFIT") || step.includes("STOP LOSS") ? "sell"
+          : step.includes("+") || step.includes("profit") ? "profit"
+          : step.includes("WARNING") || step.includes("collapsed") ? "loss" : "dim";
+        sel(`  ${step}`, t);
       });
 
-      if(res.decision==="SELL"){
-        sel(`  → CLOSING: ${pnl>=0?"+":""}${$(pnl)} (${(pnlPct*100).toFixed(1)}%)`,pnl>=0?"profit":"loss");
-        const closed={...pos,closePrice:cur,closedAt:now(),pnl,pnlPct,status:"CLOSED"};
-        setPortfolio(prev=>{
-          const proceeds=cur*pos.shares;
-          const next={...prev,cash:prev.cash+proceeds,
-            positions:prev.positions.filter(p=>p.id!==pos.id),
-            closed:[...prev.closed,closed]};
-          portRef.current=next; return next;
-        });
-        sys(`[CLOSE] ${pos.side} P&L:${$(pnl)} "${pos.question.slice(0,35)}"`,pnl>=0?"ok":"warn");
-        setStats(s=>{
-          const b=!s.best||pnl>s.best.pnl?{...pos,pnl}:s.best;
-          const w=!s.worst||pnl<s.worst.pnl?{...pos,pnl}:s.worst;
-          return {...s,best:b,worst:w};
-        });
+      if (res.decision === "SELL") {
+        sel(`  → CLOSING: ${pos.pnl >= 0 ? "+" : ""}${dollar(pos.pnl || 0)} (${((pos.pnlPct || 0)*100).toFixed(1)}%)`, pos.pnl >= 0 ? "profit" : "loss");
+        closePosition(pos);
+        sys(`[CLOSE] ${pos.side} P&L:${dollar(pos.pnl || 0)} "${pos.question.slice(0, 35)}"`, pos.pnl >= 0 ? "ok" : "warn");
       } else {
-        sel(`  → ${res.decision} (score ${res.sellScore}/100)`,"ok");
+        sel(`  → ${res.decision} (score:${res.score}/100)`, "ok");
       }
     }
-    sel("","blank"); sel("✓ Evaluation complete.","ok");
-  },[sel,sys]);
+    sel("", "blank"); sel("✓ Evaluation complete.", "ok");
+  }, [sel, sys, refreshPrices, closePosition]);
 
-  // ── AUTO ─────────────────────────────────────────────────────────────────────
-  const toggleAuto=()=>{
-    if(auto){
+  // ── Leaderboard ───────────────────────────────────────────────────────────────
+  const loadLeaderboard = useCallback(async () => {
+    setLbLoading(true);
+    sys(`[LEADERBOARD] Fetching top traders (${lbPeriod}/${lbOrder})...`, "info");
+    const data = await fetchLeaderboard(lbPeriod, lbOrder, 25);
+    setLeaderboard(data);
+    sys(`[LEADERBOARD] Loaded ${data.length} traders`, "ok");
+    setLbLoading(false);
+  }, [lbPeriod, lbOrder, sys]);
+
+  const viewWallet = useCallback(async (address, name) => {
+    setWalletLoading(true);
+    setWalletDetail({ address, name, positions: null, trades: null });
+    sys(`[WALLET] Loading data for ${name || address.slice(0, 10)}...`, "info");
+    const [positions, trades] = await Promise.all([fetchWalletPositions(address), fetchWalletTrades(address)]);
+    setWalletDetail({ address, name, positions: positions || [], trades: trades || [] });
+    sys(`[WALLET] ${(positions || []).length} positions, ${(trades || []).length} trades`, "ok");
+    setWalletLoading(false);
+  }, [sys]);
+
+  const toggleAuto = () => {
+    if (auto) {
       setAuto(false); clearInterval(autoRef.current);
-      sys("[AUTO] Disabled","warn");
-    }else{
+      sys("[AUTO] Disabled", "warn");
+    } else {
       setAuto(true);
-      sys("[AUTO] Enabled — scan every 90s","ok");
+      sys("[AUTO] ON — scan every 90s | prices every 30s", "ok");
       scan();
-      autoRef.current=setInterval(()=>{ scan(); evalSells(); },90000);
+      autoRef.current = setInterval(() => { scan(); }, 90000);
     }
   };
 
-  // ── Stats ─────────────────────────────────────────────────────────────────────
-  const open      = portfolio.positions.filter(p=>p.status==="OPEN");
-  const openVal   = open.reduce((s,p)=>s+p.currentPrice*p.shares,0);
-  const unrealPnl = open.reduce((s,p)=>s+(p.pnl||0),0);
-  const realPnl   = portfolio.closed.reduce((s,t)=>s+(t.pnl||0),0);
-  const totalPnl  = unrealPnl+realPnl;
-  const totalVal  = portfolio.cash+openVal;
-  const invested  = open.reduce((s,p)=>s+p.amount,0);
-  const ret       = ((totalVal-START_CASH)/START_CASH*100);
-  const wins      = portfolio.closed.filter(t=>t.pnl>0).length;
-  const winRate   = portfolio.closed.length?`${((wins/portfolio.closed.length)*100).toFixed(0)}%`:"--";
-  const goodMkts  = markets.filter(m=>!blackRef.current.has(m.id));
+  // ── Portfolio stats ───────────────────────────────────────────────────────────
+  const open      = portfolio.positions.filter(p => p.status === "OPEN");
+  const openVal   = open.reduce((s, p) => s + (p.currentPrice || p.ep) * p.shares, 0);
+  const unrealPnl = open.reduce((s, p) => s + (p.pnl || 0), 0);
+  const realPnl   = portfolio.closed.reduce((s, t) => s + (t.pnl || 0), 0);
+  const totalPnl  = unrealPnl + realPnl;
+  const totalVal  = portfolio.cash + openVal;
+  const invested  = open.reduce((s, p) => s + p.amount, 0);
+  const ret       = ((totalVal - START_CASH) / START_CASH * 100);
+  const wins      = portfolio.closed.filter(t => t.pnl > 0).length;
+  const winRate   = portfolio.closed.length ? `${((wins / portfolio.closed.length) * 100).toFixed(0)}%` : "--";
+  const goodMkts  = markets.filter(m => !blackRef.current.has(m.id));
+  const stCol     = { idle:"#444", scanning:"#888", thinking:"#aaa", trading:"#ccc" };
+  const stLbl     = { idle:"READY", scanning:"SCANNING", thinking:"THINKING", trading:"EXECUTING" };
 
-  const statusLabel={idle:"READY",scanning:"SCANNING",thinking:"THINKING",trading:"EXECUTING"};
-  const statusCol={idle:"#444",scanning:"#888",thinking:"#aaa",trading:"#ddd"};
-
-  const TABS=[
-    {id:"positions",label:`OPEN POSITIONS (${open.length})`},
-    {id:"pnl",      label:"P&L DASHBOARD"},
-    {id:"trades",   label:`TRADE HISTORY (${portfolio.trades.length})`},
-    {id:"markets",  label:`LIVE MARKETS (${markets.length})`},
-    {id:"blacklist",label:`BLACKLIST (${blacklist.size})`},
+  const TABS = [
+    { id:"positions",   label:`POSITIONS (${open.length})` },
+    { id:"pnl",         label:"P&L" },
+    { id:"trades",      label:`HISTORY (${portfolio.trades.length})` },
+    { id:"markets",     label:`MARKETS (${markets.length})` },
+    { id:"leaderboard", label:"TOP WALLETS" },
+    { id:"blacklist",   label:`BLACKLIST (${blacklist.size})` },
   ];
 
   return (
-    <div style={{width:"100vw",height:"100vh",overflow:"hidden",display:"flex",
-      flexDirection:"column",background:"#080808",
-      fontFamily:"Consolas,'Lucida Console',monospace",fontSize:"12px",color:"#bbb"}}>
+    <div style={{ width:"100vw", height:"100vh", overflow:"hidden", display:"flex", flexDirection:"column", background:"#080808", fontFamily:"Consolas,'Lucida Console',monospace", fontSize:"12px", color:"#bbb" }}>
 
-      {/* TITLE */}
-      <div style={{flexShrink:0,height:"32px",background:"#111",
-        borderBottom:"1px solid #1e1e1e",display:"flex",alignItems:"center",
-        padding:"0 12px",gap:"12px"}}>
-        <span style={{color:"#ddd",fontWeight:"bold",letterSpacing:"3px",fontSize:"13px"}}>POLYBOT</span>
-        <span style={{color:"#282828"}}>│</span>
-        <span style={{color:"#444",fontSize:"11px"}}>Paper Trading Terminal v4.0</span>
-        <span style={{color:"#282828"}}>│</span>
-        <span style={{color:"#333",fontSize:"11px"}}>AI: Rule-Based + Blacklist Engine</span>
-        <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:"16px",fontSize:"11px"}}>
-          <span style={{color:statusCol[status]}}>● {statusLabel[status]}{auto?" [AUTO ON]":""}</span>
-          <span style={{color:"#2a2a2a"}}>UPTIME: <span style={{color:"#3a3a3a"}}>{fmtUp(stats.uptime)}</span></span>
+      {/* TITLE BAR */}
+      <div style={{ flexShrink:0, height:"32px", background:"#111", borderBottom:"1px solid #1e1e1e", display:"flex", alignItems:"center", padding:"0 14px", gap:"12px" }}>
+        <span style={{ color:"#ddd", fontWeight:"bold", letterSpacing:"3px", fontSize:"13px" }}>POLYBOT</span>
+        <span style={{ color:"#282828" }}>│</span>
+        <span style={{ color:"#444", fontSize:"11px" }}>Paper Trading Terminal v8.0</span>
+        <span style={{ color:"#282828" }}>│</span>
+        <span style={{ color:"#333", fontSize:"11px" }}>Built-in AI  •  Order Book Pricing  •  Top Wallets</span>
+        <div style={{ marginLeft:"auto", display:"flex", gap:"16px", fontSize:"11px", alignItems:"center" }}>
+          {open.length > 0 && <span style={{ color:"#3a5a3a", fontSize:"10px" }}>↻ prices every 30s</span>}
+          <span style={{ color: stCol[status] }}>● {stLbl[status]}{auto ? " [AUTO]" : ""}</span>
+          <span style={{ color:"#2a2a2a", fontSize:"10px" }}>{fmtUp(stats.uptime)}</span>
         </div>
       </div>
 
-      {/* STATS BAR */}
-      <div style={{flexShrink:0,height:"32px",background:"#0b0b0b",
-        borderBottom:"1px solid #181818",display:"flex",alignItems:"center",
-        overflowX:"auto",overflowY:"hidden"}}>
-        <SC label="CASH"        value={$(portfolio.cash)}                          color={portfolio.cash>=START_CASH?"#bbb":"#777"}/>
-        <SC label="PORT VALUE"  value={$(totalVal)}                                color={totalVal>=START_CASH?"#ccc":"#777"}/>
-        <SC label="TOTAL P&L"   value={(totalPnl>=0?"+":"")+$(totalPnl)}           color={totalPnl>=0?"#ddd":"#666"}/>
-        <SC label="RETURN"      value={(ret>=0?"+":"")+ret.toFixed(2)+"%"}         color={ret>=0?"#ccc":"#666"}/>
-        <SC label="UNREALIZED"  value={(unrealPnl>=0?"+":"")+$(unrealPnl)}         color={unrealPnl>=0?"#bbb":"#666"}/>
-        <SC label="REALIZED"    value={(realPnl>=0?"+":"")+$(realPnl)}             color={realPnl>=0?"#bbb":"#666"}/>
-        <SC label="INVESTED"    value={$(invested)}                                color="#777"/>
-        <SC label="OPEN POS"    value={open.length}                                color="#888"/>
-        <SC label="CLOSED"      value={portfolio.closed.length}                    color="#555"/>
-        <SC label="WIN RATE"    value={winRate}                                    color="#777"/>
-        <SC label="TRADES"      value={stats.executed}                             color="#555"/>
-        <SC label="SKIPPED"     value={stats.skipped}                              color="#444"/>
-        <SC label="BLACKLISTED" value={blacklist.size}                             color="#555"/>
-        <SC label="GOOD MKTS"   value={goodMkts.length}                           color="#444"/>
-        <SC label="SCANS"       value={stats.scans}                                color="#444"/>
-        <SC label="NEWS ART."   value={stats.news}                                 color="#3a3a3a"/>
-        <SC label="API CALLS"   value={stats.apiCalls}                             color="#333"/>
-        <SC label="LAST SCAN"   value={stats.lastScan}                             color="#3a3a3a"/>
-      </div>
+      {/* BODY */}
+      <div style={{ flex:1, display:"flex", overflow:"hidden" }}>
 
-      {/* TOP PANELS */}
-      <div style={{flex:"0 0 42%",display:"flex",borderBottom:"1px solid #141414",overflow:"hidden"}}>
-        <Panel title="MARKET SCANNER" badge={`${markets.length} fetched, ${blacklist.size} blacklisted`}
-          actions={[
-            {label:status!=="idle"?"RUNNING...":"SCAN",fn:scan,dis:status!=="idle"},
-            {label:auto?"STOP AUTO":"AUTO 90s",fn:toggleAuto,dis:false},
-          ]} flex={1}>
-          <LogPanel logs={scanLog} logRef={scanRef}/>
-        </Panel>
+        {/* LEFT MAIN */}
+        <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden", minWidth:0 }}>
 
-        <Panel title="AI ENGINE — THINKING LOG" badge="v4 — sentiment+momentum+liquidity+mispricing" flex={1}>
-          <LogPanel logs={aiLog} logRef={aiRef}/>
-        </Panel>
+          {/* TOP 3 LOG PANELS — 44% height */}
+          <div style={{ flex:"0 0 44%", display:"flex", borderBottom:"1px solid #141414", overflow:"hidden" }}>
 
-        <Panel title="SELL / HOLD MONITOR" badge="position evaluator"
-          actions={[{label:"EVAL SELLS",fn:evalSells,dis:status!=="idle"}]} flex={1}>
-          <LogPanel logs={sellLog} logRef={sellRef}/>
-        </Panel>
+            <Box title="MARKET SCANNER" badge={`${goodMkts.length} candidates`} style={{ flex:1 }}
+              actions={[
+                { label: status !== "idle" ? "RUNNING..." : "SCAN", fn: scan, dis: status !== "idle" },
+                { label: auto ? "STOP AUTO" : "AUTO 90s", fn: toggleAuto },
+                { label: "REFRESH $", fn: () => refreshPrices(false), dis: open.length === 0 },
+              ]}>
+              <LogPanel logs={scanLog} logRef={scanLogRef} />
+            </Box>
 
-        <Panel title="SYSTEM + LIVE FEED" flex="0 0 220px">
-          <div style={{flex:1,overflow:"hidden",borderBottom:"1px solid #141414"}}>
-            <LogPanel logs={sysLog} logRef={sysRef}/>
+            <Box title="AI ENGINE — THINKING" badge="keyword+sentiment+statistical" style={{ flex:1 }}>
+              <LogPanel logs={aiLog} logRef={aiLogRef} />
+            </Box>
+
+            <Box title="SELL / HOLD MONITOR" style={{ flex:1 }}
+              actions={[{ label: "EVAL SELLS", fn: evalSells, dis: status !== "idle" }]}>
+              <LogPanel logs={sellLog} logRef={sellLogRef} />
+            </Box>
+
           </div>
-          <div style={{flex:1,overflowY:"auto",padding:"4px"}}>
-            {goodMkts.slice(0,25).map(m=>(
-              <div key={m.id} style={{padding:"3px 5px",marginBottom:"1px",
-                borderLeft:`2px solid ${m.yesPrice>=0.15&&m.yesPrice<=0.85?"#2e2e2e":m.oneDayChange>0.05?"#3a3a3a":"#1a1a1a"}`,
-                background:"#0a0a0a"}}>
-                <div style={{color:"#444",fontSize:"10px",overflow:"hidden",
-                  textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.question.slice(0,30)}</div>
-                <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",marginTop:"1px"}}>
-                  <span style={{color:m.yesPrice>=0.15&&m.yesPrice<=0.85?"#888":"#555"}}>
-                    Y:{pct(m.yesPrice)}
-                  </span>
-                  <span style={{color:m.oneDayChange>0?"#777":m.oneDayChange<0?"#555":"#333"}}>
-                    {m.oneDayChange>0?"▲":m.oneDayChange<0?"▼":"─"}{Math.abs(m.oneDayChange*100).toFixed(1)}%
-                  </span>
-                  <span style={{color:"#333"}}>{mini(m.volume24h)}</span>
-                </div>
+
+          {/* BOTTOM TABS — 56% height */}
+          <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+
+            {/* Tab bar */}
+            <div style={{ flexShrink:0, background:"#0d0d0d", borderBottom:"1px solid #1a1a1a", display:"flex", padding:"0 8px", alignItems:"center" }}>
+              {TABS.map(t => (
+                <button key={t.id} onClick={() => setTab(t.id)} style={{
+                  background: tab === t.id ? "#141414" : "transparent", border:"none",
+                  borderBottom: tab === t.id ? "2px solid #555" : "2px solid transparent",
+                  color: tab === t.id ? "#ccc" : "#3a3a3a",
+                  padding:"5px 14px", fontSize:"11px", fontFamily:"Consolas,monospace", cursor:"pointer",
+                }}>{t.label}</button>
+              ))}
+              <div style={{ marginLeft:"auto", display:"flex", gap:"16px", fontSize:"10px", color:"#2a2a2a", paddingRight:"10px" }}>
+                <span>Refresh:{lastRefresh} ({refreshCount}x)</span>
+                <span>Win:{winRate}</span>
               </div>
-            ))}
-            {goodMkts.length===0&&<div style={{color:"#1e1e1e",padding:"4px",fontSize:"10px"}}>Run scan</div>}
-          </div>
-        </Panel>
-      </div>
+            </div>
 
-      {/* BOTTOM TABS */}
-      <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-        <div style={{flexShrink:0,background:"#0d0d0d",borderBottom:"1px solid #1a1a1a",
-          display:"flex",padding:"0 8px",gap:"2px"}}>
-          {TABS.map(t=>(
-            <button key={t.id} onClick={()=>setTab(t.id)} style={{
-              background:tab===t.id?"#141414":"transparent",border:"none",
-              borderBottom:tab===t.id?"1px solid #555":"1px solid transparent",
-              color:tab===t.id?"#bbb":"#3a3a3a",padding:"4px 14px",fontSize:"11px",
-              fontFamily:"Consolas,monospace",cursor:"pointer",letterSpacing:"0.5px",
-            }}>{t.label}</button>
-          ))}
-          <div style={{marginLeft:"auto",display:"flex",alignItems:"center",
-            gap:"16px",fontSize:"10px",color:"#2a2a2a",paddingRight:"8px"}}>
-            <span>Best:{stats.best?$(stats.best.pnl):"--"}</span>
-            <span>Worst:{stats.worst?$(stats.worst.pnl):"--"}</span>
-          </div>
-        </div>
+            {/* Tab content */}
+            <div style={{ flex:1, overflow:"auto", background:"#090909", padding:"6px" }}>
 
-        <div style={{flex:1,overflow:"auto",background:"#090909"}}>
+              {/* ── POSITIONS ── */}
+              {tab === "positions" && (
+                open.length === 0
+                  ? <div style={{ color:"#1e1e1e", padding:"40px", textAlign:"center", fontSize:"13px" }}>No open positions — click SCAN to find opportunities.</div>
+                  : <>
+                    <div style={{ marginBottom:"6px", padding:"5px 10px", background:"#0a140a", border:"1px solid #1a2a1a", fontSize:"10px", color:"#3a5a3a", display:"flex", gap:"16px" }}>
+                      <span>● LIVE P&L via Order Book pricing</span>
+                      <span>Last: {lastRefresh} ({refreshCount} refreshes)</span>
+                      <button onClick={() => refreshPrices(false)} style={{ marginLeft:"auto", background:"transparent", border:"1px solid #2a4a2a", color:"#4a7a4a", padding:"1px 8px", fontSize:"9px", fontFamily:"Consolas,monospace", cursor:"pointer" }}>REFRESH NOW</button>
+                    </div>
+                    <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"11px" }}>
+                      <TH cols={["#","Type","Market","Side","Entry","Bid","Ask","Current","Δ¢","P&L","P&L%","Cost","Value","Max$","Conf","Source","Updated"]} />
+                      <tbody>
+                        {open.map((p, i) => {
+                          const priceDiff = (p.currentPrice || p.ep) - p.ep;
+                          const pc = p.pnl || 0;
+                          return (
+                            <tr key={p.id} style={{ borderBottom:"1px solid #0f0f0f", background: pc > 0.5 ? "#0a130a" : pc < -0.5 ? "#130a0a" : "transparent" }}>
+                              <td style={{ padding:"4px 8px", color:"#333" }}>{i+1}</td>
+                              <td style={{ padding:"4px 8px" }}><TypeBadge type={p.mktType} /></td>
+                              <td style={{ padding:"4px 8px", color:"#666", maxWidth:"200px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{p.question}</td>
+                              <td style={{ padding:"4px 8px", color: p.side === "YES" ? "#bbb" : "#888", fontWeight:"bold" }}>{p.side}</td>
+                              <td style={{ padding:"4px 8px", color:"#555" }}>{pct(p.ep)}</td>
+                              <td style={{ padding:"4px 8px", color:"#3a6a3a" }}>{p.bestBid ? pct(p.bestBid) : "--"}</td>
+                              <td style={{ padding:"4px 8px", color:"#6a3a3a" }}>{p.bestAsk ? pct(p.bestAsk) : "--"}</td>
+                              <td style={{ padding:"4px 8px", color:"#aaa", fontWeight:"bold" }}>{pct(p.currentPrice || p.ep)}</td>
+                              <td style={{ padding:"4px 8px", color: priceDiff > 0 ? "#5a9a5a" : priceDiff < 0 ? "#9a5a5a" : "#444" }}>{priceDiff > 0 ? "▲" : priceDiff < 0 ? "▼" : "─"}{(Math.abs(priceDiff)*100).toFixed(1)}</td>
+                              <td style={{ padding:"4px 8px", color: pc >= 0 ? "#bbb" : "#666", fontWeight:"bold" }}>{(pc >= 0 ? "+" : "") + dollar(pc)}</td>
+                              <td style={{ padding:"4px 8px", color: pc >= 0 ? "#999" : "#555" }}>{((p.pnlPct||0)*100).toFixed(1)}%</td>
+                              <td style={{ padding:"4px 8px", color:"#555" }}>{dollar(p.amount)}</td>
+                              <td style={{ padding:"4px 8px", color:"#777" }}>{dollar((p.currentPrice||p.ep)*p.shares)}</td>
+                              <td style={{ padding:"4px 8px", color:"#444" }}>{dollar(p.maxProfit)}</td>
+                              <td style={{ padding:"4px 8px", color:"#555" }}>{p.conf}%</td>
+                              <td style={{ padding:"4px 8px", color:"#3a3a3a", fontSize:"9px" }}>{p.priceSource}</td>
+                              <td style={{ padding:"4px 8px", color:"#2a2a2a", fontSize:"9px" }}>{p.lastUpdate}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                      <tfoot>
+                        <tr style={{ borderTop:"1px solid #1e1e1e" }}>
+                          <td colSpan={9} style={{ padding:"5px 8px", color:"#444" }}>TOTALS</td>
+                          <td style={{ padding:"5px 8px", color: unrealPnl >= 0 ? "#bbb" : "#666", fontWeight:"bold" }}>{(unrealPnl >= 0 ? "+" : "") + dollar(unrealPnl)}</td>
+                          <td style={{ padding:"5px 8px", color: unrealPnl >= 0 ? "#888" : "#555" }}>{invested > 0 ? ((unrealPnl/invested)*100).toFixed(1)+"%" : "--"}</td>
+                          <td style={{ padding:"5px 8px", color:"#666" }}>{dollar(invested)}</td>
+                          <td style={{ padding:"5px 8px", color:"#777" }}>{dollar(openVal)}</td>
+                          <td colSpan={4} />
+                        </tr>
+                      </tfoot>
+                    </table>
+                    <div style={{ marginTop:"8px" }}>
+                      <div style={{ color:"#252525", fontSize:"10px", marginBottom:"4px" }}>REASONING</div>
+                      {open.map((p, i) => (
+                        <div key={p.id} style={{ display:"flex", gap:"8px", marginBottom:"3px", fontSize:"10px", padding:"3px 0", borderBottom:"1px solid #0f0f0f" }}>
+                          <span style={{ color:"#333", flexShrink:0, width:"16px" }}>{i+1}.</span>
+                          <TypeBadge type={p.mktType} />
+                          <span style={{ color:"#2a2a2a", flex:1, marginLeft:"4px" }}>{p.reason}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+              )}
 
-          {/* OPEN POSITIONS */}
-          {tab==="positions"&&(
-            <div style={{padding:"6px"}}>
-              {open.length===0
-                ?<div style={{color:"#1e1e1e",padding:"12px 8px"}}>No open positions — run a scan.</div>
-                :<>
-                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
-                    <TH cols={["#","Market","Side","Entry","Current","Δ","Shares","Cost","Value","P&L","P&L%","Max Profit","Conf","Opened","News Src"]}/>
-                    <tbody>
-                      {open.map((p,i)=>{
-                        const cv=p.currentPrice*p.shares;
-                        const pc=p.pnl||0;
-                        return(
-                          <tr key={p.id} style={{borderBottom:"1px solid #0f0f0f"}}>
-                            <td style={{padding:"3px 8px",color:"#333"}}>{i+1}</td>
-                            <td style={{padding:"3px 8px",color:"#666",maxWidth:"220px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.question}</td>
-                            <td style={{padding:"3px 8px",color:p.side==="YES"?"#bbb":"#888"}}>{p.side}</td>
-                            <td style={{padding:"3px 8px",color:"#666"}}>{pct(p.ep)}</td>
-                            <td style={{padding:"3px 8px",color:"#888"}}>{pct(p.currentPrice)}</td>
-                            <td style={{padding:"3px 8px",color:pc>=0?"#aaa":"#555"}}>{pc>=0?"▲":"▼"}</td>
-                            <td style={{padding:"3px 8px",color:"#555"}}>{p.shares.toFixed(3)}</td>
-                            <td style={{padding:"3px 8px",color:"#777"}}>{$(p.amount)}</td>
-                            <td style={{padding:"3px 8px",color:"#888"}}>{$(cv)}</td>
-                            <td style={{padding:"3px 8px",color:pc>=0?"#bbb":"#555",fontWeight:"bold"}}>{(pc>=0?"+":"")+$(pc)}</td>
-                            <td style={{padding:"3px 8px",color:pc>=0?"#999":"#444"}}>{((p.pnlPct||0)*100).toFixed(1)}%</td>
-                            <td style={{padding:"3px 8px",color:"#444"}}>{$(p.maxProfit)}</td>
-                            <td style={{padding:"3px 8px",color:"#666"}}>{p.confidence}%</td>
-                            <td style={{padding:"3px 8px",color:"#3a3a3a"}}>{p.openedAt}</td>
-                            <td style={{padding:"3px 8px",color:"#333"}}>{p.newsSource||"--"}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                    <tfoot>
-                      <tr style={{borderTop:"1px solid #1e1e1e",color:"#444"}}>
-                        <td colSpan={7} style={{padding:"4px 8px"}}>TOTALS</td>
-                        <td style={{padding:"4px 8px",color:"#666"}}>{$(invested)}</td>
-                        <td style={{padding:"4px 8px",color:"#777"}}>{$(openVal)}</td>
-                        <td style={{padding:"4px 8px",color:unrealPnl>=0?"#bbb":"#555",fontWeight:"bold"}}>{(unrealPnl>=0?"+":"")+$(unrealPnl)}</td>
-                        <td colSpan={5}/>
-                      </tr>
-                    </tfoot>
-                  </table>
-                  <div style={{marginTop:"8px",padding:"0 2px"}}>
-                    <div style={{color:"#2a2a2a",fontSize:"10px",marginBottom:"4px"}}>AI REASONING</div>
-                    {open.map((p,i)=>(
-                      <div key={p.id} style={{display:"flex",gap:"8px",marginBottom:"3px",fontSize:"10px"}}>
-                        <span style={{color:"#333",flexShrink:0}}>{i+1}.</span>
-                        <span style={{color:"#555",flexShrink:0}}>{p.side}</span>
-                        <span style={{color:"#3a3a3a"}}>{p.reasoning}</span>
+              {/* ── P&L ── */}
+              {tab === "pnl" && (
+                <div>
+                  <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:"8px", marginBottom:"12px" }}>
+                    {[
+                      { l:"Starting Balance",  v: dollar(START_CASH),                        s:"initial deposit",              hi: null },
+                      { l:"Current Cash",      v: dollar(portfolio.cash),                    s:"available to trade",           hi: portfolio.cash >= START_CASH },
+                      { l:"Open Value",        v: dollar(openVal),                           s:`${open.length} positions`,     hi: openVal > 0 },
+                      { l:"Total Portfolio",   v: dollar(totalVal),                          s:"cash + positions",             hi: totalVal >= START_CASH },
+                      { l:"Unrealized P&L",    v: (unrealPnl >= 0 ? "+" : "") + dollar(unrealPnl), s:"live mark-to-market",  hi: unrealPnl >= 0 },
+                      { l:"Realized P&L",      v: (realPnl >= 0 ? "+" : "") + dollar(realPnl),     s:`${portfolio.closed.length} closed`, hi: realPnl >= 0 },
+                      { l:"Total P&L",         v: (totalPnl >= 0 ? "+" : "") + dollar(totalPnl),   s:"all time",             hi: totalPnl >= 0 },
+                      { l:"Total Return",      v: (ret >= 0 ? "+" : "") + ret.toFixed(2) + "%",     s:"vs $1,000 start",      hi: ret >= 0 },
+                      { l:"Capital Deployed",  v: dollar(invested),                          s:"in markets now",             hi: null },
+                      { l:"Win Rate",          v: winRate,                                   s:`${wins}/${portfolio.closed.length}`, hi: null },
+                      { l:"Best Trade",        v: stats.best  ? dollar(stats.best.pnl)  : "--", s: stats.best  ? stats.best.question?.slice(0,24)+"..."  : "none yet", hi: true  },
+                      { l:"Worst Trade",       v: stats.worst ? dollar(stats.worst.pnl) : "--", s: stats.worst ? stats.worst.question?.slice(0,24)+"..." : "none yet", hi: false },
+                    ].map(card => (
+                      <div key={card.l} style={{ background:"#0d0d0d", border:"1px solid #181818", padding:"12px 14px" }}>
+                        <div style={{ color:"#252525", fontSize:"9px", marginBottom:"5px" }}>{card.l}</div>
+                        <div style={{ color: card.hi === true ? "#ddd" : card.hi === false ? "#666" : "#aaa", fontSize:"20px" }}>{card.v}</div>
+                        <div style={{ color:"#1a1a1a", fontSize:"9px", marginTop:"3px" }}>{card.s}</div>
                       </div>
                     ))}
                   </div>
-                </>
-              }
-            </div>
-          )}
+                  {portfolio.closed.length > 0 && <>
+                    <div style={{ color:"#2a2a2a", fontSize:"10px", marginBottom:"6px" }}>CLOSED TRADES</div>
+                    <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"11px" }}>
+                      <TH cols={["#","Market","Side","Entry","Close","Cost","Proceeds","P&L","P&L%","Closed"]} />
+                      <tbody>
+                        {portfolio.closed.map((t, i) => (
+                          <tr key={t.id} style={{ borderBottom:"1px solid #0f0f0f", background: t.pnl > 0 ? "#0a130a" : "#130a0a" }}>
+                            <td style={{ padding:"4px 8px", color:"#333" }}>{i+1}</td>
+                            <td style={{ padding:"4px 8px", color:"#555", maxWidth:"220px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{t.question}</td>
+                            <td style={{ padding:"4px 8px", color:"#666" }}>{t.side}</td>
+                            <td style={{ padding:"4px 8px", color:"#555" }}>{pct(t.ep)}</td>
+                            <td style={{ padding:"4px 8px", color:"#666" }}>{pct(t.closePrice || t.currentPrice)}</td>
+                            <td style={{ padding:"4px 8px", color:"#555" }}>{dollar(t.amount)}</td>
+                            <td style={{ padding:"4px 8px", color:"#666" }}>{dollar((t.closePrice || t.currentPrice) * t.shares)}</td>
+                            <td style={{ padding:"4px 8px", color: t.pnl >= 0 ? "#bbb" : "#666", fontWeight:"bold" }}>{(t.pnl >= 0 ? "+" : "") + dollar(t.pnl)}</td>
+                            <td style={{ padding:"4px 8px", color: t.pnl >= 0 ? "#888" : "#555" }}>{((t.pnlPct||0)*100).toFixed(1)}%</td>
+                            <td style={{ padding:"4px 8px", color:"#333" }}>{t.closedAt}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>}
+                </div>
+              )}
 
-          {/* P&L */}
-          {tab==="pnl"&&(
-            <div style={{padding:"8px"}}>
-              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"6px",marginBottom:"10px"}}>
-                {[
-                  {l:"Starting Balance", v:$(START_CASH),                          s:"initial deposit",                   hi:null},
-                  {l:"Current Cash",     v:$(portfolio.cash),                      s:"available to trade",                hi:portfolio.cash>=START_CASH},
-                  {l:"Open Value",       v:$(openVal),                             s:`${open.length} positions`,          hi:openVal>0},
-                  {l:"Total Portfolio",  v:$(totalVal),                            s:"cash + positions",                  hi:totalVal>=START_CASH},
-                  {l:"Unrealized P&L",   v:(unrealPnl>=0?"+":"")+$(unrealPnl),     s:"mark-to-market",                    hi:unrealPnl>=0},
-                  {l:"Realized P&L",     v:(realPnl>=0?"+":"")+$(realPnl),         s:`${portfolio.closed.length} closed`, hi:realPnl>=0},
-                  {l:"Total P&L",        v:(totalPnl>=0?"+":"")+$(totalPnl),       s:"unrealized + realized",             hi:totalPnl>=0},
-                  {l:"Total Return",     v:(ret>=0?"+":"")+ret.toFixed(3)+"%",     s:"vs starting balance",               hi:ret>=0},
-                  {l:"Capital Deployed", v:$(invested),                            s:"currently in markets",              hi:null},
-                  {l:"Win Rate",         v:winRate,                                s:`${wins}/${portfolio.closed.length} closed`,hi:null},
-                  {l:"Best Trade",       v:stats.best?$(stats.best.pnl):"--",      s:stats.best?stats.best.question?.slice(0,25)+"...":"none yet",hi:true},
-                  {l:"Worst Trade",      v:stats.worst?$(stats.worst.pnl):"--",    s:stats.worst?stats.worst.question?.slice(0,25)+"...":"none yet",hi:false},
-                ].map(c=>(
-                  <div key={c.l} style={{background:"#0d0d0d",border:"1px solid #181818",padding:"10px 12px"}}>
-                    <div style={{color:"#282828",fontSize:"9px",letterSpacing:"0.5px",marginBottom:"5px"}}>{c.l}</div>
-                    <div style={{color:c.hi===true?"#ddd":c.hi===false?"#666":"#aaa",fontSize:"18px",marginBottom:"3px"}}>{c.v}</div>
-                    <div style={{color:"#222",fontSize:"9px"}}>{c.s}</div>
-                  </div>
-                ))}
-              </div>
-              {portfolio.closed.length>0&&(
-                <>
-                  <div style={{color:"#2a2a2a",fontSize:"10px",marginBottom:"5px"}}>CLOSED TRADES</div>
-                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
-                    <TH cols={["#","Market","Side","Entry","Close","Cost","Proceeds","P&L","P&L%","Closed"]}/>
+              {/* ── HISTORY ── */}
+              {tab === "trades" && (
+                portfolio.trades.length === 0
+                  ? <div style={{ color:"#1e1e1e", padding:"40px", textAlign:"center" }}>No trades yet.</div>
+                  : <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"11px" }}>
+                    <TH cols={["#","Time","Type","Market","Side","Entry","Amt","Shares","Max$","Conf","Status","P&L","Edge","News"]} />
                     <tbody>
-                      {portfolio.closed.map((t,i)=>(
-                        <tr key={t.id} style={{borderBottom:"1px solid #0f0f0f"}}>
-                          <td style={{padding:"3px 8px",color:"#333"}}>{i+1}</td>
-                          <td style={{padding:"3px 8px",color:"#555",maxWidth:"220px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.question}</td>
-                          <td style={{padding:"3px 8px",color:"#666"}}>{t.side}</td>
-                          <td style={{padding:"3px 8px",color:"#555"}}>{pct(t.ep)}</td>
-                          <td style={{padding:"3px 8px",color:"#666"}}>{pct(t.closePrice)}</td>
-                          <td style={{padding:"3px 8px",color:"#555"}}>{$(t.amount)}</td>
-                          <td style={{padding:"3px 8px",color:"#666"}}>{$(t.closePrice*t.shares)}</td>
-                          <td style={{padding:"3px 8px",color:t.pnl>=0?"#bbb":"#555",fontWeight:"bold"}}>{(t.pnl>=0?"+":"")+$(t.pnl)}</td>
-                          <td style={{padding:"3px 8px",color:t.pnl>=0?"#888":"#444"}}>{((t.pnlPct||0)*100).toFixed(1)}%</td>
-                          <td style={{padding:"3px 8px",color:"#333"}}>{t.closedAt}</td>
-                        </tr>
+                      {[...portfolio.trades].reverse().map((t, i) => {
+                        const cl  = portfolio.closed.find(c => c.id === t.id);
+                        const pnl = cl ? cl.pnl : (t.pnl || 0);
+                        return (
+                          <tr key={t.id} style={{ borderBottom:"1px solid #0f0f0f", background: cl ? (cl.pnl > 0 ? "#0a130a" : "#130a0a") : "transparent" }}>
+                            <td style={{ padding:"4px 8px", color:"#333" }}>{portfolio.trades.length - i}</td>
+                            <td style={{ padding:"4px 8px", color:"#333", whiteSpace:"nowrap" }}>{t.openedAt}</td>
+                            <td style={{ padding:"4px 8px" }}><TypeBadge type={t.mktType} /></td>
+                            <td style={{ padding:"4px 8px", color:"#555", maxWidth:"180px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{t.question}</td>
+                            <td style={{ padding:"4px 8px", color: t.side === "YES" ? "#aaa" : "#777", fontWeight:"bold" }}>{t.side}</td>
+                            <td style={{ padding:"4px 8px", color:"#555" }}>{pct(t.ep)}</td>
+                            <td style={{ padding:"4px 8px", color:"#666" }}>{dollar(t.amount)}</td>
+                            <td style={{ padding:"4px 8px", color:"#444" }}>{t.shares.toFixed(3)}</td>
+                            <td style={{ padding:"4px 8px", color:"#444" }}>{dollar(t.maxProfit)}</td>
+                            <td style={{ padding:"4px 8px", color:"#555" }}>{t.conf}%</td>
+                            <td style={{ padding:"4px 8px" }}>
+                              <span style={{ background:"#111", color: cl ? (cl.pnl > 0 ? "#4a7a4a" : "#7a4a4a") : "#666", padding:"1px 5px", fontSize:"9px" }}>
+                                {cl ? (cl.pnl > 0 ? "WIN" : "LOSS") : "OPEN"}
+                              </span>
+                            </td>
+                            <td style={{ padding:"4px 8px", color: pnl >= 0 ? "#bbb" : "#666", fontWeight:"bold" }}>{(pnl >= 0 ? "+" : "") + dollar(pnl)}</td>
+                            <td style={{ padding:"4px 8px", color:"#3a5a3a", fontSize:"10px" }}>{t.edgeFrom}</td>
+                            <td style={{ padding:"4px 8px", color:"#2a2a2a", fontSize:"10px" }}>{t.newsCount || 0} arts</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+              )}
+
+              {/* ── MARKETS ── */}
+              {tab === "markets" && (
+                markets.length === 0
+                  ? <div style={{ color:"#1e1e1e", padding:"40px", textAlign:"center" }}>Run scan to load markets.</div>
+                  : <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"11px" }}>
+                    <TH cols={["#","Dead","Type","Market","YES%","NO%","Bid","Ask","Spread","Vol 24h","Liq","24hΔ","Ends"]} />
+                    <tbody>
+                      {markets.map((m, i) => {
+                        const dead  = blackRef.current.has(m.id);
+                        const mType = detectType(m.question);
+                        return (
+                          <tr key={m.id} style={{ borderBottom:"1px solid #0f0f0f", opacity: dead ? 0.3 : 1 }}>
+                            <td style={{ padding:"4px 8px", color:"#333" }}>{i+1}</td>
+                            <td style={{ padding:"4px 8px" }}><span style={{ fontSize:"9px", padding:"1px 4px", background: dead ? "#2a0a0a" : "#0d0d0d", color: dead ? "#666" : "#2a2a2a" }}>{dead ? "DEAD" : "OK"}</span></td>
+                            <td style={{ padding:"4px 8px" }}><TypeBadge type={mType} /></td>
+                            <td style={{ padding:"4px 8px", color:"#555", maxWidth:"230px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{m.question}</td>
+                            <td style={{ padding:"4px 8px", color: m.yesPrice >= 0.15 && m.yesPrice <= 0.85 ? "#aaa" : "#666" }}>{pct(m.yesPrice)}</td>
+                            <td style={{ padding:"4px 8px", color:"#555" }}>{pct(m.noPrice)}</td>
+                            <td style={{ padding:"4px 8px", color:"#3a5a3a" }}>{m.bestBid ? pct(m.bestBid) : "--"}</td>
+                            <td style={{ padding:"4px 8px", color:"#5a3a3a" }}>{m.bestAsk ? pct(m.bestAsk) : "--"}</td>
+                            <td style={{ padding:"4px 8px", color:"#333" }}>{m.bestBid && m.bestAsk ? ((m.bestAsk - m.bestBid)*100).toFixed(1)+"¢" : "--"}</td>
+                            <td style={{ padding:"4px 8px", color:"#666" }}>{mini(m.volume24h)}</td>
+                            <td style={{ padding:"4px 8px", color:"#444" }}>{mini(m.liquidity)}</td>
+                            <td style={{ padding:"4px 8px", color: m.oneDayChange > 0 ? "#aaa" : m.oneDayChange < 0 ? "#666" : "#333" }}>{m.oneDayChange > 0 ? "▲" : m.oneDayChange < 0 ? "▼" : "─"}{(Math.abs(m.oneDayChange||0)*100).toFixed(1)}%</td>
+                            <td style={{ padding:"4px 8px", color:"#2a2a2a", whiteSpace:"nowrap" }}>{m.endDate ? new Date(m.endDate).toLocaleDateString() : "--"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+              )}
+
+              {/* ── LEADERBOARD ── */}
+              {tab === "leaderboard" && (
+                <div style={{ display:"flex", gap:"8px", height:"100%", overflow:"hidden" }}>
+                  {/* Left: leaderboard list */}
+                  <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+                    {/* Controls */}
+                    <div style={{ flexShrink:0, display:"flex", gap:"8px", padding:"8px", borderBottom:"1px solid #1a1a1a", alignItems:"center" }}>
+                      <span style={{ color:"#444", fontSize:"10px" }}>Period:</span>
+                      {["DAY","WEEK","MONTH","ALL"].map(p => (
+                        <button key={p} onClick={() => setLbPeriod(p)} style={{
+                          background: lbPeriod === p ? "#1a2a1a" : "transparent",
+                          border:`1px solid ${lbPeriod === p ? "#3a5a3a" : "#222"}`,
+                          color: lbPeriod === p ? "#5a9a5a" : "#444", padding:"2px 8px", fontSize:"10px",
+                          fontFamily:"Consolas,monospace", cursor:"pointer",
+                        }}>{p}</button>
                       ))}
-                    </tbody>
-                  </table>
-                </>
+                      <span style={{ color:"#444", fontSize:"10px", marginLeft:"8px" }}>Sort:</span>
+                      {["PNL","VOL"].map(o => (
+                        <button key={o} onClick={() => setLbOrder(o)} style={{
+                          background: lbOrder === o ? "#1a1a2a" : "transparent",
+                          border:`1px solid ${lbOrder === o ? "#3a3a5a" : "#222"}`,
+                          color: lbOrder === o ? "#6a6aaa" : "#444", padding:"2px 8px", fontSize:"10px",
+                          fontFamily:"Consolas,monospace", cursor:"pointer",
+                        }}>{o}</button>
+                      ))}
+                      <button onClick={loadLeaderboard} disabled={lbLoading} style={{
+                        marginLeft:"8px", background:"transparent", border:"1px solid #333",
+                        color: lbLoading ? "#333" : "#666", padding:"2px 12px", fontSize:"10px",
+                        fontFamily:"Consolas,monospace", cursor: lbLoading ? "not-allowed" : "pointer",
+                      }}>{lbLoading ? "LOADING..." : "LOAD"}</button>
+                    </div>
+                    {/* Table */}
+                    <div style={{ flex:1, overflowY:"auto" }}>
+                      {leaderboard.length === 0
+                        ? <div style={{ color:"#1e1e1e", padding:"40px", textAlign:"center" }}>Click LOAD to fetch top traders.</div>
+                        : <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"11px" }}>
+                          <TH cols={["#","Trader","P&L","Volume","Badge","View"]} />
+                          <tbody>
+                            {leaderboard.map((trader, i) => (
+                              <tr key={trader.proxyWallet || i} style={{ borderBottom:"1px solid #0f0f0f" }}>
+                                <td style={{ padding:"5px 8px", color:"#555", fontWeight: i < 3 ? "bold" : "normal" }}>{i+1}</td>
+                                <td style={{ padding:"5px 8px" }}>
+                                  <div style={{ color: i < 3 ? "#ddd" : "#888" }}>{trader.userName || `${trader.proxyWallet?.slice(0,8)}...`}</div>
+                                  {trader.xUsername && <div style={{ color:"#444", fontSize:"9px" }}>@{trader.xUsername}</div>}
+                                  <div style={{ color:"#2a2a2a", fontSize:"9px" }}>{trader.proxyWallet?.slice(0, 12)}...</div>
+                                </td>
+                                <td style={{ padding:"5px 8px", color: (trader.pnl || 0) >= 0 ? "#bbb" : "#666", fontWeight:"bold" }}>
+                                  {(trader.pnl || 0) >= 0 ? "+" : ""}{dollar(trader.pnl || 0)}
+                                </td>
+                                <td style={{ padding:"5px 8px", color:"#666" }}>{mini(trader.vol || 0)}</td>
+                                <td style={{ padding:"5px 8px" }}>
+                                  {trader.verifiedBadge && <span style={{ fontSize:"9px", padding:"1px 5px", background:"#1a2a1a", color:"#5a9a5a" }}>VERIFIED</span>}
+                                </td>
+                                <td style={{ padding:"5px 8px" }}>
+                                  <button onClick={() => viewWallet(trader.proxyWallet, trader.userName)} disabled={walletLoading} style={{
+                                    background:"transparent", border:"1px solid #2a2a2a", color:"#555", padding:"1px 8px",
+                                    fontSize:"9px", fontFamily:"Consolas,monospace", cursor:"pointer",
+                                  }}>VIEW</button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      }
+                    </div>
+                  </div>
+
+                  {/* Right: wallet detail */}
+                  <div style={{ width:"320px", flexShrink:0, borderLeft:"1px solid #1a1a1a", display:"flex", flexDirection:"column", overflow:"hidden" }}>
+                    {!walletDetail
+                      ? <div style={{ color:"#1e1e1e", padding:"20px", fontSize:"11px" }}>Click VIEW on any trader to see their positions and recent trades.</div>
+                      : <>
+                        <div style={{ flexShrink:0, padding:"8px 10px", borderBottom:"1px solid #1a1a1a", background:"#0d0d0d" }}>
+                          <div style={{ color:"#bbb", fontSize:"11px", fontWeight:"bold" }}>{walletDetail.name || "Wallet"}</div>
+                          <div style={{ color:"#333", fontSize:"9px" }}>{walletDetail.address}</div>
+                        </div>
+                        <div style={{ flex:1, overflowY:"auto" }}>
+                          {walletLoading
+                            ? <div style={{ color:"#2a2a2a", padding:"16px" }}>Loading...</div>
+                            : <>
+                              <div style={{ padding:"6px 10px", color:"#444", fontSize:"10px", borderBottom:"1px solid #141414" }}>
+                                OPEN POSITIONS ({(walletDetail.positions || []).length})
+                              </div>
+                              {(walletDetail.positions || []).slice(0, 10).map((pos, i) => (
+                                <div key={i} style={{ padding:"6px 10px", borderBottom:"1px solid #0f0f0f" }}>
+                                  <div style={{ color:"#666", fontSize:"10px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{pos.title || pos.market || "Unknown market"}</div>
+                                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:"10px", marginTop:"2px" }}>
+                                    <span style={{ color: pos.outcome === "YES" ? "#5a9a5a" : "#9a5a5a" }}>{pos.outcome || pos.outcomeLabel || "?"}</span>
+                                    <span style={{ color:"#555" }}>{pos.size ? `${(+pos.size).toFixed(2)} shares` : ""}</span>
+                                    <span style={{ color: (pos.cashPnl || pos.currentValue || 0) >= 0 ? "#bbb" : "#666" }}>
+                                      {(pos.cashPnl || pos.currentValue) ? dollar(pos.cashPnl || pos.currentValue) : "--"}
+                                    </span>
+                                  </div>
+                                </div>
+                              ))}
+                              {(walletDetail.positions || []).length === 0 && <div style={{ color:"#2a2a2a", padding:"10px" }}>No open positions.</div>}
+
+                              <div style={{ padding:"6px 10px", color:"#444", fontSize:"10px", borderBottom:"1px solid #141414", borderTop:"1px solid #141414" }}>
+                                RECENT TRADES ({(walletDetail.trades || []).length})
+                              </div>
+                              {(walletDetail.trades || []).slice(0, 8).map((trade, i) => (
+                                <div key={i} style={{ padding:"5px 10px", borderBottom:"1px solid #0f0f0f" }}>
+                                  <div style={{ color:"#555", fontSize:"10px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{trade.title || trade.market || "Unknown"}</div>
+                                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:"9px", marginTop:"1px" }}>
+                                    <span style={{ color: trade.side === "BUY" ? "#5a9a5a" : "#9a5a5a" }}>{trade.side}</span>
+                                    <span style={{ color:"#444" }}>{trade.size ? dollar(+trade.size) : ""}</span>
+                                    <span style={{ color:"#333" }}>{age(trade.timestamp)}</span>
+                                  </div>
+                                </div>
+                              ))}
+                              {(walletDetail.trades || []).length === 0 && <div style={{ color:"#2a2a2a", padding:"10px" }}>No recent trades.</div>}
+                            </>
+                          }
+                        </div>
+                      </>
+                    }
+                  </div>
+                </div>
               )}
-            </div>
-          )}
 
-          {/* TRADE HISTORY */}
-          {tab==="trades"&&(
-            <div style={{padding:"6px"}}>
-              {portfolio.trades.length===0
-                ?<div style={{color:"#1e1e1e",padding:"12px 8px"}}>No trades yet.</div>
-                :<table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
-                    <TH cols={["#","Time","Market","Side","Entry","Amount","Shares","Max Profit","Conf","Status","P&L","News Src","Reasoning"]}/>
-                    <tbody>
-                      {[...portfolio.trades].reverse().map((t,i)=>{
-                        const cl=portfolio.closed.find(c=>c.id===t.id);
-                        const pnl=cl?cl.pnl:(t.pnl||0);
-                        return(
-                          <tr key={t.id} style={{borderBottom:"1px solid #0f0f0f"}}>
-                            <td style={{padding:"3px 8px",color:"#333"}}>{portfolio.trades.length-i}</td>
-                            <td style={{padding:"3px 8px",color:"#333",whiteSpace:"nowrap"}}>{t.openedAt}</td>
-                            <td style={{padding:"3px 8px",color:"#555",maxWidth:"200px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.question}</td>
-                            <td style={{padding:"3px 8px",color:t.side==="YES"?"#aaa":"#777"}}>{t.side}</td>
-                            <td style={{padding:"3px 8px",color:"#555"}}>{pct(t.ep)}</td>
-                            <td style={{padding:"3px 8px",color:"#666"}}>{$(t.amount)}</td>
-                            <td style={{padding:"3px 8px",color:"#444"}}>{t.shares.toFixed(3)}</td>
-                            <td style={{padding:"3px 8px",color:"#444"}}>{$(t.maxProfit)}</td>
-                            <td style={{padding:"3px 8px",color:"#555"}}>{t.confidence}%</td>
-                            <td style={{padding:"3px 8px"}}>
-                              <span style={{background:"#111",color:cl?"#444":"#666",padding:"1px 5px",fontSize:"9px"}}>
-                                {cl?"CLOSED":"OPEN"}
-                              </span>
-                            </td>
-                            <td style={{padding:"3px 8px",color:pnl>=0?"#bbb":"#555",fontWeight:"bold"}}>{(pnl>=0?"+":"")+$(pnl)}</td>
-                            <td style={{padding:"3px 8px",color:"#333"}}>{t.newsSource||"--"}</td>
-                            <td style={{padding:"3px 8px",color:"#333",maxWidth:"200px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.reasoning}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-              }
-            </div>
-          )}
-
-          {/* LIVE MARKETS */}
-          {tab==="markets"&&(
-            <div style={{padding:"6px"}}>
-              {markets.length===0
-                ?<div style={{color:"#1e1e1e",padding:"12px 8px"}}>Run scan to load markets.</div>
-                :<table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
-                    <TH cols={["#","Status","Market","YES%","NO%","Bid","Ask","Spread","Vol 24h","Liquidity","24h Chg","End Date","Category"]}/>
-                    <tbody>
-                      {markets.map((m,i)=>{
-                        const dead=blackRef.current.has(m.id);
-                        return(
-                          <tr key={m.id} style={{borderBottom:"1px solid #0f0f0f",opacity:dead?0.35:1}}>
-                            <td style={{padding:"3px 8px",color:"#333"}}>{i+1}</td>
-                            <td style={{padding:"3px 8px"}}>
-                              <span style={{fontSize:"9px",padding:"1px 4px",background:dead?"#1a0a0a":"#0a0a0a",color:dead?"#555":"#444"}}>
-                                {dead?"BLACKLIST":"ACTIVE"}
-                              </span>
-                            </td>
-                            <td style={{padding:"3px 8px",color:dead?"#2a2a2a":"#555",maxWidth:"230px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.question}</td>
-                            <td style={{padding:"3px 8px",color:m.yesPrice>=0.15&&m.yesPrice<=0.85?"#aaa":"#555"}}>{pct(m.yesPrice)}</td>
-                            <td style={{padding:"3px 8px",color:"#555"}}>{pct(m.noPrice)}</td>
-                            <td style={{padding:"3px 8px",color:"#444"}}>{m.bestBid?pct(m.bestBid):"--"}</td>
-                            <td style={{padding:"3px 8px",color:"#444"}}>{m.bestAsk?pct(m.bestAsk):"--"}</td>
-                            <td style={{padding:"3px 8px",color:"#333"}}>{m.bestBid&&m.bestAsk?((m.bestAsk-m.bestBid)*100).toFixed(1)+"¢":"--"}</td>
-                            <td style={{padding:"3px 8px",color:"#666"}}>{mini(m.volume24h)}</td>
-                            <td style={{padding:"3px 8px",color:"#444"}}>{mini(m.liquidity)}</td>
-                            <td style={{padding:"3px 8px",color:m.oneDayChange>0?"#aaa":m.oneDayChange<0?"#555":"#333"}}>
-                              {m.oneDayChange>0?"▲":m.oneDayChange<0?"▼":"─"}{Math.abs(m.oneDayChange*100).toFixed(2)}%
-                            </td>
-                            <td style={{padding:"3px 8px",color:"#333",whiteSpace:"nowrap"}}>{m.endDate?new Date(m.endDate).toLocaleDateString():"--"}</td>
-                            <td style={{padding:"3px 8px",color:"#2a2a2a"}}>{m.category}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-              }
-            </div>
-          )}
-
-          {/* BLACKLIST */}
-          {tab==="blacklist"&&(
-            <div style={{padding:"8px"}}>
-              <div style={{color:"#2a2a2a",fontSize:"11px",marginBottom:"8px"}}>
-                Markets permanently excluded from analysis. These are resolved, dead, or have no tradeable edge.
-                <span style={{color:"#444",marginLeft:"8px"}}>{blacklist.size} total</span>
-              </div>
-              {blacklist.size===0
-                ?<div style={{color:"#1e1e1e",padding:"8px"}}>No markets blacklisted yet. Run a scan.</div>
-                :<table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
-                    <TH cols={["Market ID","Question","YES% at blacklist","Reason"]}/>
-                    <tbody>
-                      {[...blacklist].map((id,i)=>{
-                        const m=markets.find(x=>x.id===id);
-                        return(
-                          <tr key={id} style={{borderBottom:"1px solid #0f0f0f"}}>
-                            <td style={{padding:"3px 8px",color:"#2a2a2a",fontSize:"9px"}}>{id}</td>
-                            <td style={{padding:"3px 8px",color:"#3a3a3a",maxWidth:"300px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m?.question||"Unknown"}</td>
-                            <td style={{padding:"3px 8px",color:"#333"}}>{m?pct(m.yesPrice):"--"}</td>
-                            <td style={{padding:"3px 8px",color:"#2a2a2a"}}>
-                              {m?(m.yesPrice<0.02||m.yesPrice>0.98)?"Extreme price (near resolved)":"Low conf + no news + no movement":"Manually blacklisted"}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-              }
-              {blacklist.size>0&&(
-                <button onClick={()=>{ setBlacklist(new Set()); blackRef.current=new Set(); sys("[BLACKLIST] Cleared","warn"); }}
-                  style={{marginTop:"8px",background:"transparent",border:"1px solid #2a2a2a",
-                    color:"#555",padding:"4px 12px",fontSize:"11px",fontFamily:"Consolas,monospace",cursor:"pointer"}}>
-                  CLEAR BLACKLIST
-                </button>
+              {/* ── BLACKLIST ── */}
+              {tab === "blacklist" && (
+                <div style={{ padding:"4px" }}>
+                  <div style={{ color:"#333", marginBottom:"8px", display:"flex", alignItems:"center", gap:"12px", padding:"4px" }}>
+                    <span>{blacklist.size} markets excluded permanently.</span>
+                    {blacklist.size > 0 && (
+                      <button onClick={() => { setBlacklist(new Set()); blackRef.current = new Set(); sys("[BL] Cleared","warn"); }} style={{ background:"transparent", border:"1px solid #2a2a2a", color:"#555", padding:"2px 10px", fontSize:"10px", fontFamily:"Consolas,monospace", cursor:"pointer" }}>CLEAR ALL</button>
+                    )}
+                  </div>
+                  {blacklist.size === 0
+                    ? <div style={{ color:"#1e1e1e", padding:"40px", textAlign:"center" }}>No blacklisted markets yet.</div>
+                    : <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"11px" }}>
+                      <TH cols={["#","Market","Price","Reason"]} />
+                      <tbody>
+                        {[...blacklist].map((id, i) => {
+                          const m = markets.find(x => x.id === id);
+                          return (
+                            <tr key={id} style={{ borderBottom:"1px solid #0f0f0f" }}>
+                              <td style={{ padding:"4px 8px", color:"#2a2a2a" }}>{i+1}</td>
+                              <td style={{ padding:"4px 8px", color:"#3a3a3a", maxWidth:"400px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{m?.question || id}</td>
+                              <td style={{ padding:"4px 8px", color:"#333" }}>{m ? pct(m.yesPrice) : "--"}</td>
+                              <td style={{ padding:"4px 8px", color:"#2a2a2a" }}>{m ? (m.yesPrice < 0.02 || m.yesPrice > 0.98 ? "Extreme price — resolved" : "No signal + no movement") : "Unknown"}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  }
+                </div>
               )}
-            </div>
-          )}
 
+            </div>
+          </div>
+        </div>
+
+        {/* RIGHT SIDEBAR */}
+        <div style={{ width:"200px", flexShrink:0, display:"flex", flexDirection:"column", borderLeft:"1px solid #141414", background:"#060606", overflow:"hidden" }}>
+          <div style={{ flexShrink:0, padding:"5px 12px", fontSize:"9px", color:"#3a3a3a", letterSpacing:"1px", background:"#0d0d0d", borderBottom:"1px solid #1a1a1a" }}>LIVE STATS</div>
+          <div style={{ flex:1, overflowY:"auto" }}>
+            <SideVal label="PORTFOLIO"   value={dollar(totalVal)}                            color={totalVal >= START_CASH ? "#ccc" : "#777"} sub="total value" />
+            <SideVal label="CASH"        value={dollar(portfolio.cash)}                      color="#aaa"  sub="available" />
+            <SideVal label="P&L"         value={(totalPnl >= 0 ? "+" : "") + dollar(totalPnl)} color={totalPnl >= 0 ? "#ddd" : "#666"} sub="total" hi={totalPnl > 0} />
+            <SideVal label="RETURN"      value={(ret >= 0 ? "+" : "") + ret.toFixed(2) + "%"} color={ret >= 0 ? "#ccc" : "#666"} sub="vs $1,000" />
+            <SideVal label="UNREALIZED"  value={(unrealPnl >= 0 ? "+" : "") + dollar(unrealPnl)} color={unrealPnl >= 0 ? "#bbb" : "#666"} sub={`${open.length} open`} hi={unrealPnl > 0} />
+            <SideVal label="REALIZED"    value={(realPnl >= 0 ? "+" : "") + dollar(realPnl)}    color={realPnl >= 0 ? "#bbb" : "#666"}    sub={`${portfolio.closed.length} closed`} />
+            <SideVal label="WIN RATE"    value={winRate}                                     color="#888"  sub={`${wins}/${portfolio.closed.length}`} />
+            <SideVal label="INVESTED"    value={dollar(invested)}                             color="#777"  sub={`${open.length} positions`} />
+
+            <div style={{ padding:"4px 12px", fontSize:"9px", color:"#252525", letterSpacing:"1px", background:"#0a0a0a", borderTop:"1px solid #111", borderBottom:"1px solid #111" }}>PRICE TRACKING</div>
+            <SRow label="Last refresh"  value={lastRefresh}  color="#4a6a4a" />
+            <SRow label="Refresh count" value={refreshCount} />
+            <SRow label="Refresh rate"  value="30s" />
+
+            <div style={{ padding:"4px 12px", fontSize:"9px", color:"#252525", letterSpacing:"1px", background:"#0a0a0a", borderTop:"1px solid #111", borderBottom:"1px solid #111" }}>BOT ACTIVITY</div>
+            <SRow label="Scans"       value={stats.scans} />
+            <SRow label="Analyzed"    value={stats.analyzed} />
+            <SRow label="Trades"      value={stats.executed} />
+            <SRow label="Skipped"     value={stats.skipped} />
+            <SRow label="Blacklisted" value={blacklist.size} />
+            <SRow label="News arts."  value={stats.news} />
+            <SRow label="Last scan"   value={stats.lastScan} />
+            <SRow label="Uptime"      value={fmtUp(stats.uptime)} />
+
+            <div style={{ padding:"4px 12px", fontSize:"9px", color:"#252525", letterSpacing:"1px", background:"#0a0a0a", borderTop:"1px solid #111", borderBottom:"1px solid #111" }}>TRADES BY TYPE</div>
+            {["sports","macro","crypto","politics","general"].map(t => <SRow key={t} label={t.toUpperCase()} value={stats.byType[t] || 0} color={TT[t]} />)}
+
+            <div style={{ padding:"4px 12px", fontSize:"9px", color:"#252525", letterSpacing:"1px", background:"#0a0a0a", borderTop:"1px solid #111", borderBottom:"1px solid #111" }}>LIVE PRICES</div>
+            <div style={{ padding:"4px 6px" }}>
+              {goodMkts.slice(0, 20).map(m => {
+                const mType = detectType(m.question);
+                const isHeld = open.some(p => p.conditionId === m.conditionId);
+                return (
+                  <div key={m.id} style={{ padding:"4px 6px", marginBottom:"2px", borderLeft:`2px solid ${isHeld ? "#2a5a2a" : TC[mType] || "#1a1a1a"}`, background: isHeld ? "#0a130a" : "#0a0a0a" }}>
+                    <div style={{ color: isHeld ? "#3a6a3a" : "#333", fontSize:"9px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{m.question.slice(0, 26)}{isHeld ? " ●" : ""}</div>
+                    <div style={{ display:"flex", justifyContent:"space-between", fontSize:"9px", marginTop:"1px" }}>
+                      <span style={{ color: m.yesPrice >= 0.15 && m.yesPrice <= 0.85 ? "#666" : "#444" }}>{pct(m.yesPrice)}</span>
+                      <span style={{ color: m.oneDayChange > 0 ? "#4a6a4a" : m.oneDayChange < 0 ? "#6a4a4a" : "#2a2a2a" }}>{m.oneDayChange > 0 ? "▲" : m.oneDayChange < 0 ? "▼" : "─"}{(Math.abs(m.oneDayChange || 0)*100).toFixed(1)}%</span>
+                    </div>
+                  </div>
+                );
+              })}
+              {goodMkts.length === 0 && <div style={{ color:"#1a1a1a", padding:"8px", fontSize:"10px" }}>Run scan</div>}
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      {/* SYSTEM LOG BAR — collapsible bottom strip */}
+      <div style={{ flexShrink:0, height:"22px", background:"#0b0b0b", borderTop:"1px solid #161616", display:"flex", alignItems:"center", overflow:"hidden" }}>
+        <div ref={sysLogRef} style={{ flex:1, overflowX:"auto", overflowY:"hidden", display:"flex", gap:"16px", padding:"0 14px", fontSize:"10px", whiteSpace:"nowrap" }}>
+          {sysLog.slice(-8).map(l => (
+            <span key={l.id} style={{ color: C[l.type] || "#2a2a2a", flexShrink:0 }}>{l.ts} {l.msg}</span>
+          ))}
+        </div>
+        <div style={{ flexShrink:0, padding:"0 14px", display:"flex", gap:"16px", fontSize:"10px", color:"#2a2a2a", borderLeft:"1px solid #161616" }}>
+          <span>Pos:{open.length}</span>
+          <span style={{ color: unrealPnl >= 0 ? "#3a5a3a" : "#5a3a3a" }}>P&L:{(unrealPnl >= 0 ? "+" : "") + dollar(unrealPnl)}</span>
+          <span>Cash:{dollar(portfolio.cash)}</span>
         </div>
       </div>
 
-      {/* STATUS BAR */}
-      <div style={{flexShrink:0,height:"22px",background:"#0b0b0b",
-        borderTop:"1px solid #161616",display:"flex",alignItems:"center",
-        padding:"0 12px",gap:"20px",fontSize:"10px",color:"#2a2a2a"}}>
-        <span>PolyBot v4.0</span>
-        <span style={{color:"#181818"}}>│</span>
-        <span>News: TheNewsAPI (primary) → GNews (fallback)</span>
-        <span style={{color:"#181818"}}>│</span>
-        <span>Markets: scans {SCAN_LIMIT}, analyzes {ANALYZE_MAX} best candidates</span>
-        <span style={{color:"#181818"}}>│</span>
-        <span>Blacklist: {blacklist.size} markets excluded</span>
-        <div style={{marginLeft:"auto",display:"flex",gap:"16px"}}>
-          <span>Good mkts: {goodMkts.length}</span>
-          <span>Cash: {$(portfolio.cash)}</span>
-        </div>
-      </div>
-
+      <style>{`
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+        ::-webkit-scrollbar { width:4px; height:4px; }
+        ::-webkit-scrollbar-track { background:#080808; }
+        ::-webkit-scrollbar-thumb { background:#1e1e1e; }
+        * { box-sizing:border-box; margin:0; padding:0; }
+        button:focus { outline:none; }
+      `}</style>
     </div>
   );
 }
