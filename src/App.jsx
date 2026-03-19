@@ -170,147 +170,356 @@ async function getNews(question) {
   return { articles: [], query, apiUsed: "none" };
 }
 
-// ─── Built-in AI Engine (no external API) ────────────────────────────────────
-// Pure rule-based system with keyword scoring + statistical edge models
-// Falls back to statistical model when no news is available
+// ─── AI Engine v2 — Smarter Trading Logic ────────────────────────────────────
+//
+// Key improvements over v1:
+//  1. Question-aware sentiment — news must be RELEVANT to the market question
+//  2. Much higher confidence threshold (65%) with stricter scoring
+//  3. Spread penalty — wide bid/ask spread = immediate loss on entry
+//  4. Time-to-resolution scoring — closer deadlines = higher risk
+//  5. Multi-signal agreement required — need 2+ signals to fire
+//  6. Position sizing tied to edge magnitude, not just confidence
+//  7. Separate logic per market type with proven strategies
 
-const BULL_STRONG = ["confirmed","won","wins","victory","champion","elected","signed","passed","secured","clinched","approved","announced","official","frontrunner","leads","leading","dominated","beat","scored","promoted","qualified","rate cut","cut rates","dovish","easing","pivot","all time high","ath","etf approved","majority","landslide","polling lead","referendum passed","deal signed","agreement reached","unbeaten","clean sheet","guaranteed"];
-const BULL_WEAK   = ["likely","expected","projected","anticipated","favored","ahead","gaining","rising","possible","may","could","optimistic","progress","supported","backed","on track","set to","poised","forecast","predicted","hopeful","improving"];
-const BEAR_STRONG = ["lost","defeated","failed","rejected","cancelled","blocked","collapsed","impossible","ruled out","crisis","arrested","indicted","resigned","dropped out","eliminated","relegated","injured","suspended","banned","rate hike","hawkish","tightening","recession","impeached","disqualified","knocked out","sacked","fired"];
-const BEAR_WEAK   = ["unlikely","doubtful","struggling","declining","behind","trailing","underdog","concerns","disputed","delayed","setback","falling","decreasing","controversial","challenged","losing","missed","below expectations"];
-const NEG_WORDS   = ["not","no","won't","will not","cannot","can't","never","doesn't","isn't","wasn't","weren't","didn't","fails to"];
+// ── Keyword banks (question-specific matching) ────────────────────────────────
 
-function negatd(text, kw) {
-  const words = text.toLowerCase().split(/\s+/);
-  for (let i = 0; i < words.length; i++) {
-    if (words[i].includes(kw.split(" ")[0])) {
-      const ctx = words.slice(Math.max(0, i-4), i).join(" ");
-      if (NEG_WORDS.some(n => ctx.includes(n))) return true;
-    }
-  }
-  return false;
+const KEYWORDS = {
+  // Maps market type → keywords that actually matter
+  sports: {
+    bull: ["won","wins","victory","beat","defeated opponent","champion","leads","favourite","favorite","odds on","clean sheet","unbeaten","dominated","scored","goal","promoted","qualified"],
+    bear: ["lost","defeated","injured","suspended","banned","eliminated","relegated","crisis","fired","sacked","dropped","out of form","losing streak","conceded"],
+  },
+  macro: {
+    bull: ["rate cut","cuts rates","cut interest","dovish","pivot","easing","stimulus","pause","no change","hold rates","fed holds","below expectations","slowdown","jobs miss"],
+    bear: ["rate hike","hike rates","raised rates","hawkish","tightening","beat expectations","strong jobs","inflation surge","above expectations","emergency"],
+  },
+  crypto: {
+    bull: ["all time high","ath","bull run","rally","surge","etf approved","institutional","adoption","breakout","buy signal","halving","accumulation"],
+    bear: ["crash","ban","crackdown","sell-off","bearish","capitulation","dump","hack","exploit","regulation","restrict"],
+  },
+  politics: {
+    bull: ["elected","leads","polling ahead","frontrunner","won primary","majority","landslide","projected winner","called for","ahead in polls","inaugurated"],
+    bear: ["trailing","dropped out","scandal","indicted","impeached","polling behind","losing","conceded","withdrew","disqualified","arrested"],
+  },
+  general: {
+    bull: ["confirmed","approved","signed","passed","announced","secured","achieved","reached agreement","deal","completed","launched","approved"],
+    bear: ["rejected","blocked","cancelled","failed","denied","collapsed","withdrawn","vetoed","delayed","suspended","halted"],
+  },
+};
+
+const NEGATIONS = ["not","no","won't","will not","cannot","can't","never","didn't","doesn't","isn't","wasn't","weren't","fails to","unable to","refuse","refused"];
+
+function isNegated(words, idx, window = 5) {
+  const ctx = words.slice(Math.max(0, idx - window), idx).join(" ");
+  return NEGATIONS.some(n => ctx.includes(n));
 }
 
-function scoreSentiment(articles) {
-  if (!articles.length) return { score: 0, norm: 0, label: "NO DATA", hits: { bull: [], bear: [] } };
-  const text = articles.map(a => `${a.title} ${a.snippet}`).join(" ").toLowerCase();
-  let score = 0;
+// ── Question relevance checker ────────────────────────────────────────────────
+// Checks if an article is actually about the market question topic
+function isRelevant(article, question) {
+  const qWords = question.toLowerCase()
+    .replace(/will |the |a |an |by |on |in |at |is |are |was |were |to |of /g, "")
+    .replace(/[?!.,]/g, "")
+    .split(/\s+/)
+    .filter(w => w.length > 3);
+
+  const text = `${article.title} ${article.snippet}`.toLowerCase();
+  const matches = qWords.filter(w => text.includes(w));
+  return matches.length >= Math.max(2, Math.floor(qWords.length * 0.3));
+}
+
+// ── Smart sentiment scorer ────────────────────────────────────────────────────
+function scoreSentiment(articles, question, mType) {
+  if (!articles.length) return { score: 0, norm: 0, label: "NO NEWS", hits: { bull: [], bear: [] }, relevant: 0 };
+
+  const kw   = KEYWORDS[mType] || KEYWORDS.general;
+  let score  = 0;
+  let relevant = 0;
   const hits = { bull: [], bear: [] };
-  BULL_STRONG.forEach(kw => { if (text.includes(kw)) { score += negatd(text, kw) ? -1 : 3; hits.bull.push(kw); } });
-  BULL_WEAK.forEach(kw =>   { if (text.includes(kw)) { score += negatd(text, kw) ? -1 : 1; hits.bull.push(kw); } });
-  BEAR_STRONG.forEach(kw => { if (text.includes(kw)) { score -= 3; hits.bear.push(kw); } });
-  BEAR_WEAK.forEach(kw =>   { if (text.includes(kw)) { score -= 1; hits.bear.push(kw); } });
-  const norm = Math.max(-1, Math.min(1, score / 15));
+
+  for (const art of articles) {
+    // Only score articles that are actually about this market
+    if (!isRelevant(art, question)) continue;
+    relevant++;
+
+    const text  = `${art.title} ${art.snippet}`.toLowerCase();
+    const words = text.split(/\s+/);
+
+    kw.bull.forEach(kw => {
+      const idx = words.findIndex(w => w.includes(kw.split(" ")[0]));
+      if (idx >= 0 && text.includes(kw)) {
+        if (isNegated(words, idx)) { score -= 1; }
+        else { score += 2; hits.bull.push(kw); }
+      }
+    });
+    kw.bear.forEach(kw => {
+      if (text.includes(kw)) { score -= 2; hits.bear.push(kw); }
+    });
+  }
+
+  // Penalty if no relevant articles
+  if (relevant === 0 && articles.length > 0) score = 0;
+
+  const norm = Math.max(-1, Math.min(1, score / 10));
   return {
-    score, norm, hits,
-    label: score > 6 ? "STRONGLY BULLISH" : score > 2 ? "BULLISH" : score < -6 ? "STRONGLY BEARISH" : score < -2 ? "BEARISH" : "NEUTRAL"
+    score, norm, hits, relevant,
+    label: score >= 4 ? "STRONGLY BULLISH"
+         : score >= 2 ? "BULLISH"
+         : score <= -4 ? "STRONGLY BEARISH"
+         : score <= -2 ? "BEARISH"
+         : "NEUTRAL",
   };
 }
 
+// ── Market quality scorer ─────────────────────────────────────────────────────
+// Returns 0-100. Bad markets (illiquid, wide spread) score low.
+function scoreMarketQuality(market) {
+  let score = 50;
+
+  // Volume scoring
+  const vol = market.volume24h || 0;
+  if (vol > 500000) score += 20;
+  else if (vol > 100000) score += 12;
+  else if (vol > 25000)  score += 6;
+  else if (vol > 5000)   score += 0;
+  else score -= 15; // very low volume = avoid
+
+  // Spread scoring — wide spread means you lose on entry/exit
+  if (market.bestBid && market.bestAsk) {
+    const spread = market.bestAsk - market.bestBid;
+    if (spread < 0.01)      score += 15; // tight spread, great
+    else if (spread < 0.03) score += 8;
+    else if (spread < 0.06) score += 0;
+    else if (spread < 0.10) score -= 10;
+    else score -= 25; // >10% spread = almost certainly lose money
+  } else {
+    score -= 10; // no order book data
+  }
+
+  // Mid-range price = most uncertainty = most opportunity
+  const p = market.yesPrice;
+  if (p >= 0.30 && p <= 0.70) score += 10;
+  else if (p >= 0.15 && p <= 0.85) score += 5;
+
+  return Math.max(0, Math.min(100, score));
+}
+
+// ── Time-to-resolution risk ────────────────────────────────────────────────────
+// Markets resolving very soon are risky (no time for price to correct)
+function timeRisk(endDate) {
+  if (!endDate) return { penalty: 0, label: "unknown" };
+  const daysLeft = (new Date(endDate) - Date.now()) / (1000 * 60 * 60 * 24);
+  if (daysLeft < 0)   return { penalty: 30, label: "EXPIRED?" };
+  if (daysLeft < 1)   return { penalty: 25, label: "<1 day" };
+  if (daysLeft < 3)   return { penalty: 15, label: "<3 days" };
+  if (daysLeft < 7)   return { penalty: 5,  label: "<1 week" };
+  if (daysLeft < 30)  return { penalty: 0,  label: "<1 month" };
+  return { penalty: 0, label: ">1 month" };
+}
+
+// ── Statistical edge models ────────────────────────────────────────────────────
+function statEdge(market, mType) {
+  const p   = market.yesPrice;
+  const mom = market.oneDayChange || 0;
+  // Less edge in very liquid markets (more efficient pricing)
+  const lf  = (market.volume24h||0) > 2e6 ? 0.3 : (market.volume24h||0) > 5e5 ? 0.55 : 0.85;
+
+  if (mType === "sports") {
+    // Favourite-longshot bias — favourites are consistently overpriced
+    if (p >= 0.68 && p <= 0.83) return { action:"BUY_NO",  edge:0.05*lf, reason:`Favourite bias: ${(p*100).toFixed(0)}% likely overpriced` };
+    if (p >= 0.17 && p <= 0.32) return { action:"BUY_YES", edge:0.05*lf, reason:`Underdog value: ${(p*100).toFixed(0)}% may be underpriced` };
+    // Strong momentum in near-50/50 = follow
+    if (p >= 0.40 && p <= 0.60 && Math.abs(mom) > 0.04) {
+      return { action: mom > 0 ? "BUY_YES" : "BUY_NO", edge: Math.abs(mom)*0.5*lf, reason:`50/50 strong momentum ${(mom*100).toFixed(1)}%` };
+    }
+  } else if (mType === "crypto") {
+    // Crypto follows momentum strongly
+    if (mom > 0.08) return { action:"BUY_YES", edge:mom*0.45, reason:`Crypto bull momentum +${(mom*100).toFixed(1)}%` };
+    if (mom < -0.08) return { action:"BUY_NO",  edge:Math.abs(mom)*0.45, reason:`Crypto bear momentum ${(mom*100).toFixed(1)}%` };
+  } else if (mType === "macro") {
+    // Macro: only follow strong momentum in mid-range
+    if (p >= 0.20 && p <= 0.80 && Math.abs(mom) > 0.06) {
+      return { action: mom > 0 ? "BUY_YES" : "BUY_NO", edge: Math.abs(mom)*0.5*lf, reason:`Macro shift ${(mom*100).toFixed(1)}%` };
+    }
+  } else if (mType === "politics") {
+    // Poll shifts — only follow strong moves
+    if (Math.abs(mom) > 0.07) {
+      return { action: mom > 0 ? "BUY_YES" : "BUY_NO", edge: Math.abs(mom)*0.4*lf, reason:`Political shift ${(mom*100).toFixed(1)}%` };
+    }
+  }
+  return { action:"SKIP", edge:0, reason:"No statistical pattern" };
+}
+
+// ── Main analysis function ────────────────────────────────────────────────────
 function detectType(q) {
   const t = q.toLowerCase();
-  if (/\bvs\b|\bwin on \d{4}|premier league|la liga|bundesliga|nba|nfl|nhl|mlb|champions league/.test(t)) return "sports";
-  if (/fed|interest rate|federal reserve|bps|inflation|fomc|gdp/.test(t)) return "macro";
-  if (/bitcoin|ethereum|crypto|btc|eth|sol|xrp/.test(t)) return "crypto";
-  if (/election|president|senate|vote|democrat|republican|trump|parliament/.test(t)) return "politics";
+  if (/\bvs\b|\bvs\.|\bwin on \d{4}|premier league|la liga|bundesliga|nba|nfl|nhl|mlb|champions league|ncaa|march madness/.test(t)) return "sports";
+  if (/fed|interest rate|federal reserve|bps|fomc|cpi|gdp|unemployment/.test(t)) return "macro";
+  if (/bitcoin|ethereum|crypto|btc|eth|sol|xrp|bnb|coinbase/.test(t)) return "crypto";
+  if (/election|president|senate|vote|democrat|republican|trump|prime minister|parliament/.test(t)) return "politics";
   return "general";
 }
 
-function statEdge(market, mType) {
-  const p = market.yesPrice, mom = market.oneDayChange || 0;
-  const lf = (market.volume24h || 0) > 1e6 ? 0.4 : (market.volume24h || 0) > 1e5 ? 0.6 : 0.9;
-  if (mType === "sports") {
-    if (p >= 0.65 && p <= 0.82) return { action: "BUY_NO",  edge: 0.04*lf, reason: `Favourite bias: ${(p*100).toFixed(0)}% favourite likely overpriced` };
-    if (p >= 0.18 && p <= 0.35) return { action: "BUY_YES", edge: 0.04*lf, reason: `Underdog value: ${(p*100).toFixed(0)}% underdog may be underpriced` };
-    if (p >= 0.42 && p <= 0.58) {
-      if (mom > 0.02) return { action: "BUY_YES", edge: 0.03*lf, reason: "50/50 + upward momentum" };
-      if (mom < -0.02) return { action: "BUY_NO", edge: 0.03*lf, reason: "50/50 + downward momentum" };
-    }
-  } else if (mType === "crypto" && Math.abs(mom) > 0.06) {
-    return { action: mom > 0 ? "BUY_YES" : "BUY_NO", edge: Math.abs(mom)*0.4, reason: `Crypto momentum ${(mom*100).toFixed(1)}%` };
-  } else if (mType === "macro" && p >= 0.25 && p <= 0.75 && Math.abs(mom) > 0.04) {
-    return { action: mom > 0 ? "BUY_YES" : "BUY_NO", edge: Math.abs(mom)*0.5*lf, reason: `Macro momentum ${(mom*100).toFixed(1)}%` };
-  } else if (Math.abs(mom) > 0.10) {
-    return { action: mom > 0 ? "BUY_YES" : "BUY_NO", edge: Math.abs(mom)*0.3, reason: `Price momentum ${(mom*100).toFixed(1)}%` };
-  }
-  return { action: "SKIP", edge: 0, reason: "No statistical pattern" };
-}
-
 function analyzeMarket(market, articles, cash) {
-  const log = [];
+  const log  = [];
   const mType = detectType(market.question);
-  const p = market.yesPrice;
+  const p    = market.yesPrice;
 
-  // Hard block — never analyse extreme-priced markets for trading
+  // Hard block — never trade extreme prices
   if (p > 0.93 || p < 0.07) {
-    log.push(`BLOCKED: Price ${pct(p)} is too extreme (>93% or <7%)`);
-    log.push(`[DECISION] SKIP — market near resolution, no edge`);
-    return { action: "SKIP", conf: 0, amount: 0, edgeFrom: "blocked", mType, sent: { hits:{bull:[],bear:[]}, label:"N/A" }, stat: { action:"SKIP", reason:"Extreme price" }, log, reason: "Price too extreme to trade" };
+    log.push(`BLOCKED: ${pct(p)} too extreme`);
+    log.push(`[DECISION] SKIP`);
+    return { action:"SKIP", conf:0, amount:0, edgeFrom:"blocked", mType, sent:{hits:{bull:[],bear:[]},label:"N/A",relevant:0}, stat:{action:"SKIP",reason:"Extreme price"}, log, reason:"Price too extreme" };
   }
 
-  const sent = scoreSentiment(articles);
-  const stat = statEdge(market, mType);
-  const isMid = p >= 0.15 && p <= 0.85;
+  log.push(`[${mType.toUpperCase()}] "${market.question.slice(0,65)}"`);
+  log.push(`Price: YES ${pct(p)}  Vol: ${mini(market.volume24h||0)}  News: ${articles.length} arts`);
 
-  log.push(`[${mType.toUpperCase()}] "${market.question.slice(0, 65)}"`);
-  log.push(`Price: YES ${pct(p)}  Vol: ${mini(market.volume24h)}  News: ${articles.length} articles`);
-  log.push("─".repeat(44));
-  log.push(`[SENTIMENT] ${sent.label} (score:${sent.score})`);
+  // 1. Market quality — if the market itself is bad, don't trade it
+  const quality = scoreMarketQuality(market);
+  log.push(`[QUALITY]   Score:${quality}/100${quality < 40 ? " — LOW, penalizing" : quality > 65 ? " — GOOD" : ""}`);
+  if (quality < 30) {
+    log.push(`[DECISION] SKIP — market quality too low (spread/liquidity)`);
+    return { action:"SKIP", conf:0, amount:0, edgeFrom:"quality", mType, sent:{hits:{bull:[],bear:[]},label:"N/A",relevant:0}, stat:{action:"SKIP",reason:"Low quality"}, log, reason:"Low market quality" };
+  }
+
+  // 2. Time risk
+  const tRisk = timeRisk(market.endDate);
+  log.push(`[TIME]      Resolves: ${tRisk.label}  Penalty:${tRisk.penalty}`);
+
+  // 3. Sentiment (question-aware)
+  const sent = scoreSentiment(articles, market.question, mType);
+  log.push(`[SENTIMENT] ${sent.label} (score:${sent.score}, relevant:${sent.relevant}/${articles.length})`);
   if (sent.hits.bull.length) log.push(`  ↑ ${sent.hits.bull.slice(0,5).join(", ")}`);
   if (sent.hits.bear.length) log.push(`  ↓ ${sent.hits.bear.slice(0,5).join(", ")}`);
-  if (!articles.length)      log.push(`  ! No news — statistical model only`);
+  if (!articles.length) log.push(`  ! No news`);
 
-  log.push(`[MOMENTUM]  ${(market.oneDayChange||0) > 0 ? "UP" : (market.oneDayChange||0) < 0 ? "DOWN" : "FLAT"} (24h: ${((market.oneDayChange||0)*100).toFixed(2)}%)`);
+  // 4. Momentum
+  const mom = market.oneDayChange || 0;
+  const momDir = mom > 0.02 ? "UP" : mom < -0.02 ? "DOWN" : "FLAT";
+  log.push(`[MOMENTUM]  ${momDir} (${(mom*100).toFixed(2)}%)  Week: ${((market.oneWeekChange||0)*100).toFixed(1)}%`);
 
-  // News-based mispricing
-  let newsAction = "SKIP", newsEdge = 0;
-  if (articles.length > 0) {
-    const implied = Math.max(0.05, Math.min(0.95, p + sent.norm * 0.30));
-    newsEdge = implied - p;
-    if (newsEdge > 0.02) { newsAction = "BUY_YES"; log.push(`[NEWS EDGE] YES underpriced ~${(newsEdge*100).toFixed(0)}% (implied ${pct(implied)})`); }
-    else if (newsEdge < -0.02) { newsAction = "BUY_NO"; log.push(`[NEWS EDGE] NO underpriced ~${(Math.abs(newsEdge)*100).toFixed(0)}%`); }
-    else log.push(`[NEWS EDGE] Price ≈ implied ${pct(implied)} — no clear edge`);
-  }
-
+  // 5. Statistical edge
+  const stat = statEdge(market, mType);
   log.push(`[STAT EDGE] ${stat.action !== "SKIP" ? stat.action+" "+stat.reason : "No pattern"}`);
 
-  // Confidence
-  let conf = isMid ? 48 : 35;
-  const liqScore = (market.volume24h||0) > 1e6 ? 4 : (market.volume24h||0) > 1e5 ? 3 : (market.volume24h||0) > 2e4 ? 2 : 1;
-  conf += liqScore * 2;
-  if (articles.length > 0) conf += Math.round(Math.abs(sent.norm) * 25);
-  conf += Math.min(18, Math.round(Math.abs(newsEdge) * 80));
-  conf += Math.min(14, Math.round(stat.edge * 100));
-  if (Math.abs(market.oneDayChange||0) > 0.08) conf += 8;
-
-  // Final action
-  let action = "SKIP", edgeFrom = "none";
-  if (newsAction !== "SKIP" && Math.abs(newsEdge) > 0.02) { action = newsAction; edgeFrom = "news"; }
-  else if (stat.action !== "SKIP") { action = stat.action; edgeFrom = "statistical"; }
-  else if (articles.length && (sent.norm > 0.15 || sent.norm < -0.15)) { action = sent.norm > 0 ? "BUY_YES" : "BUY_NO"; edgeFrom = "sentiment"; }
-
-  conf = Math.max(0, Math.min(99, Math.round(conf)));
-  if (conf < 48) action = "SKIP";
-
-  // Size position
-  let amount = 0;
-  if (action !== "SKIP" && conf >= 48) {
-    const frac = Math.min(1, (conf - 48) / 32);
-    amount = Math.min(Math.round((5 + frac * 45) / 5) * 5, cash, 50);
+  // 6. News-based mispricing — requires RELEVANT news
+  let newsAction = "SKIP", newsEdge = 0;
+  if (sent.relevant >= 1) {
+    // More aggressive implied probability shift when news is strong and relevant
+    const shift = sent.norm * Math.min(0.40, 0.15 + Math.abs(sent.norm) * 0.25);
+    const implied = Math.max(0.05, Math.min(0.95, p + shift));
+    newsEdge = implied - p;
+    if (newsEdge > 0.03)       { newsAction = "BUY_YES"; log.push(`[NEWS EDGE] YES underpriced ${(newsEdge*100).toFixed(1)}% (${pct(p)} → implied ${pct(implied)})`); }
+    else if (newsEdge < -0.03) { newsAction = "BUY_NO";  log.push(`[NEWS EDGE] NO underpriced ${(Math.abs(newsEdge)*100).toFixed(1)}%`); }
+    else log.push(`[NEWS EDGE] Price ≈ implied — no clear edge`);
+  } else if (articles.length > 0) {
+    log.push(`[NEWS EDGE] Articles not relevant enough to market question`);
   }
 
-  log.push(`[CONFIDENCE] ${conf}%  (threshold: 48%)`);
+  // ── SIGNAL AGREEMENT CHECK ────────────────────────────────────────────────
+  // Count how many independent signals agree on direction
+  const signals = [];
+  if (newsAction === "BUY_YES") signals.push("news:YES");
+  if (newsAction === "BUY_NO")  signals.push("news:NO");
+  if (stat.action === "BUY_YES") signals.push("stat:YES");
+  if (stat.action === "BUY_NO")  signals.push("stat:NO");
+  if (sent.norm > 0.3 && sent.relevant > 0)  signals.push("sent:YES");
+  if (sent.norm < -0.3 && sent.relevant > 0) signals.push("sent:NO");
+  if (mom > 0.05)  signals.push("mom:YES");
+  if (mom < -0.05) signals.push("mom:NO");
+
+  const yesSignals = signals.filter(s => s.includes("YES")).length;
+  const noSignals  = signals.filter(s => s.includes("NO")).length;
+  const agreement  = Math.max(yesSignals, noSignals);
+  const conflict   = signals.length > 0 && yesSignals > 0 && noSignals > 0;
+
+  log.push(`[SIGNALS]   YES:${yesSignals} NO:${noSignals} Agreement:${agreement}${conflict ? " CONFLICTED!" : ""}`);
+
+  // ── CONFIDENCE CALCULATION ────────────────────────────────────────────────
+  // Start at 35 — must earn the right to trade
+  let conf = 35;
+
+  // Quality bonus (0-20)
+  conf += Math.round(quality * 0.2);
+
+  // Signal agreement bonus — biggest factor
+  if (agreement >= 3) conf += 25;       // 3+ signals agree = strong
+  else if (agreement === 2) conf += 12; // 2 signals agree = moderate
+  else if (agreement === 1) conf += 4;  // only 1 signal = weak
+  // Conflict penalty — signals pointing opposite directions
+  if (conflict) conf -= 15;
+
+  // News edge magnitude (0-15)
+  conf += Math.min(15, Math.round(Math.abs(newsEdge) * 60));
+
+  // Statistical edge magnitude (0-12)
+  conf += Math.min(12, Math.round(stat.edge * 80));
+
+  // Momentum strength (0-8)
+  conf += Math.min(8, Math.round(Math.abs(mom) * 60));
+
+  // Time risk penalty
+  conf -= tRisk.penalty;
+
+  // Spread penalty (repeat here too)
+  if (market.bestBid && market.bestAsk) {
+    const spread = market.bestAsk - market.bestBid;
+    if (spread > 0.08) conf -= 12;
+    else if (spread > 0.05) conf -= 6;
+  }
+
+  conf = Math.max(0, Math.min(99, Math.round(conf)));
+
+  // ── FINAL DECISION ────────────────────────────────────────────────────────
+  // Threshold: 65% — only trade with strong multi-signal conviction
+  const THRESHOLD = 65;
+
+  let action = "SKIP", edgeFrom = "none";
+
+  // Require at least 2 agreeing signals OR 1 very strong signal
+  if (agreement >= 2 && !conflict) {
+    if (yesSignals > noSignals) { action = "BUY_YES"; }
+    else if (noSignals > yesSignals) { action = "BUY_NO"; }
+  } else if (agreement === 1 && conf >= THRESHOLD + 10) {
+    // Single strong signal only if very high confidence
+    if (yesSignals > 0) action = "BUY_YES";
+    if (noSignals  > 0) action = "BUY_NO";
+  }
+
+  // Determine edge source
+  if (newsAction !== "SKIP" && Math.abs(newsEdge) > 0.03) edgeFrom = "news";
+  else if (stat.action !== "SKIP") edgeFrom = "statistical";
+  else edgeFrom = "momentum";
+
+  if (conf < THRESHOLD) action = "SKIP";
+  if (conflict) action = "SKIP"; // Never trade when signals conflict
+
+  // ── POSITION SIZING — Kelly-inspired ─────────────────────────────────────
+  // Size proportional to edge magnitude, not just confidence
+  let amount = 0;
+  if (action !== "SKIP" && conf >= THRESHOLD) {
+    const edgeMag = Math.max(Math.abs(newsEdge), stat.edge, Math.abs(mom) * 0.3);
+    // Kelly fraction: edge / odds (simplified for binary markets)
+    const kellyFrac = Math.min(0.25, edgeMag * 2); // cap at 25% of bankroll
+    const raw = cash * kellyFrac;
+    // Clamp: minimum $5, maximum $40 (conservative for paper trading)
+    amount = Math.max(5, Math.min(40, Math.round(raw / 5) * 5));
+    // Scale down if confidence is only just above threshold
+    if (conf < THRESHOLD + 8) amount = Math.min(amount, 10);
+  }
+
   log.push("─".repeat(44));
-  log.push(action !== "SKIP" && amount > 0
-    ? `[DECISION] ✓ ${action}  $${amount}  Conf:${conf}%  Edge:${edgeFrom}`
-    : `[DECISION] SKIP  Conf:${conf}%${conf < 48 ? " — below threshold" : " — no actionable edge"}`);
+  log.push(`[CONFIDENCE] ${conf}%  (threshold: ${THRESHOLD}%)`);
+  log.push(`[DECISION]  ${action !== "SKIP" ? `✓ ${action}  $${amount}  Conf:${conf}%  Sigs:${agreement}` : `SKIP  Conf:${conf}%${conf < THRESHOLD ? ` < ${THRESHOLD}%` : ""}${conflict ? " CONFLICTED" : ""}`}`);
 
   return {
-    action, conf, amount, edgeFrom, mType, sent, stat,
+    action, conf, amount, edgeFrom, mType,
+    sent, stat, quality, tRisk,
     log,
-    reason: edgeFrom === "news" ? `${sent.label} | ${stat.reason.slice(0,45)}`
-           : edgeFrom === "statistical" ? `[stat] ${stat.reason}`
-           : `[${mType}] ${sent.label}`,
+    reason: action !== "SKIP"
+      ? `[${mType}] ${sent.label} | ${stat.reason.slice(0,40)} | ${agreement} signals`
+      : `[${mType}] ${conf < THRESHOLD ? `Conf ${conf}% < ${THRESHOLD}%` : conflict ? "Conflicted signals" : "No edge"}`,
   };
 }
 
@@ -506,7 +715,7 @@ export default function App() {
       await sleep(60); sys("[OK] Auto price refresh every 30s", "ok");
       await sleep(60); sys("[OK] Paper wallet: $1,000.00 USDC", "ok");
       sys("─────────────────────────────────────────", "div");
-      sys("Threshold:48%  PriceGuard:7%-93%  Dedup:ON", "info");
+      sys("Threshold:65%  Signals:2+  Spread:checked  PriceGuard:ON", "info");
       sys("Prices: every 10s  |  Deep scan: every 3min", "info");
       sl("Scanner ready.", "dim");
       al("AI Engine ready — keyword+statistical model.", "dim");
@@ -677,16 +886,14 @@ export default function App() {
 
       // Execute paper trade
       const liveYes = m.yesPrice;
-      const liveNo  = m.noPrice;
 
       // HARD GUARDS — absolute rules, no exceptions
       const hardBlock =
-        liveYes > 0.93 ||   // YES already near certain — no edge buying YES
-        liveYes < 0.07 ||   // YES near zero — no edge buying NO (would need to resolve)
-        (result.action === "BUY_YES" && liveYes > 0.85) ||  // Don't chase high-probability YES
-        (result.action === "BUY_NO"  && liveYes < 0.15) ||  // Don't buy NO on near-zero markets
-        (m.bestAsk && m.bestAsk > 0.93) ||  // Order book ask too high — illiquid/resolved
-        (m.bestBid && m.bestBid < 0.03);    // Order book bid near zero — no buyers
+        liveYes > 0.93 || liveYes < 0.07 ||
+        (result.action === "BUY_YES" && liveYes > 0.85) ||
+        (result.action === "BUY_NO"  && liveYes < 0.15) ||
+        (m.bestAsk && m.bestAsk > 0.93) ||
+        (m.bestBid && m.bestBid < 0.03);
 
       if (hardBlock) {
         sl(`  ✗ BLOCKED: price ${pct(liveYes)} too extreme to trade safely`, "warn");
@@ -697,7 +904,7 @@ export default function App() {
       }
 
       const go = (result.action === "BUY_YES" || result.action === "BUY_NO")
-        && result.conf >= 48
+        && result.conf >= 65
         && result.amount > 0
         && portRef.current.cash >= result.amount;
 
@@ -734,7 +941,7 @@ export default function App() {
         setStats(s => ({ ...s, executed: s.executed + 1, byType: { ...s.byType, [result.mType]: (s.byType[result.mType] || 0) + 1 } }));
         tradedThisScan.add(heldKey); // prevent re-buying same market this scan
         await sleep(200);
-      } else if (result.conf < 48) {
+      } else if (result.conf < 65) {
         setStats(s => ({ ...s, skipped: s.skipped + 1 }));
         if (result.conf < 38 && !newsResult.articles.length && Math.abs(m.oneDayChange || 0) < 0.003) {
           bl.add(m.id); setBlacklist(new Set(bl)); blackRef.current = new Set(bl);
