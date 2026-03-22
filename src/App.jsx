@@ -291,31 +291,50 @@ function calcQuality(market) {
 
 function calcStatEdge(market, mType) {
   const p=market.yesPrice, mom=market.oneDayChange||0, wk=market.oneWeekChange||0;
-  const lf=(market.volume24h||0)>1e6?0.4:(market.volume24h||0)>3e5?0.6:0.85;
+  const vol=market.volume24h||0;
+  // Less edge in very liquid markets (more efficient pricing)
+  const lf = vol>2e6?0.35 : vol>5e5?0.55 : vol>1e5?0.75 : 0.90;
+
   if(mType==="sports"){
-    if(p>=0.68&&p<=0.84) return {action:"BUY_NO", edge:0.06*lf, reason:`Favourite overpriced: ${(p*100).toFixed(0)}%`};
-    if(p>=0.16&&p<=0.32) return {action:"BUY_YES", edge:0.06*lf, reason:`Underdog value: ${(p*100).toFixed(0)}%`};
-    if(p>=0.38&&p<=0.62&&Math.abs(mom)>0.05) return {action:mom>0?"BUY_YES":"BUY_NO", edge:Math.abs(mom)*0.7*lf, reason:`Near-50/50 momentum ${(mom*100).toFixed(1)}%`};
+    // Favourite-longshot bias — strongest and most reliable edge in prediction markets
+    if(p>=0.70&&p<=0.85) return {action:"BUY_NO",  edge:0.07*lf, reason:`Heavy favourite bias: ${(p*100).toFixed(0)}% overpriced`};
+    if(p>=0.65&&p<=0.70) return {action:"BUY_NO",  edge:0.05*lf, reason:`Favourite bias: ${(p*100).toFixed(0)}%`};
+    if(p>=0.15&&p<=0.28) return {action:"BUY_YES", edge:0.07*lf, reason:`Underdog value: ${(p*100).toFixed(0)}% underpriced`};
+    if(p>=0.28&&p<=0.35) return {action:"BUY_YES", edge:0.05*lf, reason:`Mild underdog: ${(p*100).toFixed(0)}%`};
+    // Near-50/50 with clear momentum
+    if(p>=0.38&&p<=0.62&&Math.abs(mom)>0.05)
+      return {action:mom>0?"BUY_YES":"BUY_NO", edge:Math.abs(mom)*0.7*lf, reason:`Coin-flip + momentum ${(mom*100).toFixed(1)}%`};
   } else if(mType==="crypto"){
-    if(mom>0.09||wk>0.14) return {action:"BUY_YES", edge:Math.max(mom,wk*0.5)*0.5, reason:`Bull momentum 24h:${(mom*100).toFixed(1)}% 7d:${(wk*100).toFixed(1)}%`};
-    if(mom<-0.09||wk<-0.14) return {action:"BUY_NO", edge:Math.max(Math.abs(mom),Math.abs(wk)*0.5)*0.5, reason:`Bear momentum 24h:${(mom*100).toFixed(1)}% 7d:${(wk*100).toFixed(1)}%`};
+    // Crypto follows momentum very strongly
+    const m = Math.max(Math.abs(mom), Math.abs(wk)*0.4);
+    if(mom>0.10||wk>0.16)  return {action:"BUY_YES", edge:m*0.55, reason:`Crypto bull: 24h+${(mom*100).toFixed(1)}% 7d+${(wk*100).toFixed(1)}%`};
+    if(mom<-0.10||wk<-0.16) return {action:"BUY_NO",  edge:m*0.55, reason:`Crypto bear: 24h${(mom*100).toFixed(1)}% 7d${(wk*100).toFixed(1)}%`};
   } else if(mType==="macro"){
-    if(p>=0.20&&p<=0.80&&Math.abs(mom)>0.055) return {action:mom>0?"BUY_YES":"BUY_NO", edge:Math.abs(mom)*0.6*lf, reason:`Macro repricing ${(mom*100).toFixed(1)}%`};
+    // Only trade macro on strong repricing in mid-range
+    if(p>=0.20&&p<=0.80&&Math.abs(mom)>0.06)
+      return {action:mom>0?"BUY_YES":"BUY_NO", edge:Math.abs(mom)*0.65*lf, reason:`Macro repricing ${(mom*100).toFixed(1)}%`};
   } else if(mType==="politics"){
-    if(Math.abs(mom)>0.07) return {action:mom>0?"BUY_YES":"BUY_NO", edge:Math.abs(mom)*0.5*lf, reason:`Political shift ${(mom*100).toFixed(1)}%`};
+    // Political markets: strong momentum = follow it
+    if(Math.abs(mom)>0.08)
+      return {action:mom>0?"BUY_YES":"BUY_NO", edge:Math.abs(mom)*0.55*lf, reason:`Poll shift ${(mom*100).toFixed(1)}%`};
+    // Mid-range political with weekly drift
+    if(p>=0.30&&p<=0.70&&Math.abs(wk)>0.10)
+      return {action:wk>0?"BUY_YES":"BUY_NO", edge:Math.abs(wk)*0.3*lf, reason:`Weekly political drift ${(wk*100).toFixed(1)}%`};
   } else {
-    if(Math.abs(mom)>0.10) return {action:mom>0?"BUY_YES":"BUY_NO", edge:Math.abs(mom)*0.4*lf, reason:`Strong momentum ${(mom*100).toFixed(1)}%`};
+    if(Math.abs(mom)>0.10)
+      return {action:mom>0?"BUY_YES":"BUY_NO", edge:Math.abs(mom)*0.45*lf, reason:`Strong momentum ${(mom*100).toFixed(1)}%`};
   }
   return {action:"SKIP", edge:0, reason:"No statistical pattern"};
 }
 
 function calcNewsEdge(price, sent) {
   if(sent.relevant===0) return {action:"SKIP", edge:0, implied:price};
-  const mag = Math.abs(sent.norm) * (0.10 + Math.abs(sent.norm)*0.30);
-  const implied = clamp(price + sent.norm*mag, 0.05, 0.95);
+  // Strength scales with both relevance and sentiment magnitude
+  const strength = Math.abs(sent.norm) * (0.08 + Math.abs(sent.norm)*0.32) * (0.5 + sent.totalRel*0.5);
+  const implied = clamp(price + sent.norm*strength, 0.05, 0.95);
   const edge = implied - price;
-  if(edge>0.035)       return {action:"BUY_YES", edge, implied};
-  else if(edge<-0.035) return {action:"BUY_NO",  edge, implied};
+  if(edge>0.03)        return {action:"BUY_YES", edge, implied};
+  else if(edge<-0.03)  return {action:"BUY_NO",  edge, implied};
   return {action:"SKIP", edge:0, implied};
 }
 
@@ -325,185 +344,218 @@ function analyzeMarket(market, articles, cash, perfStats = null) {
 
   // Hard blocks
   if(p>PRICE_MAX||p<PRICE_MIN){
-    log.push(`BLOCKED: ${pct(p)} outside [${pct(PRICE_MIN)}-${pct(PRICE_MAX)}]`);
+    log.push(`BLOCKED: ${pct(p)} outside tradeable range [${pct(PRICE_MIN)}-${pct(PRICE_MAX)}]`);
     log.push("[DECISION] SKIP");
     return {action:"SKIP",conf:0,amount:0,edgeFrom:"price",mType,log,reason:"Price out of range"};
   }
   const days=daysFrom(market.endDate);
-  if(days<0.25){
-    log.push("BLOCKED: resolves in <6h — too risky");
+  // Block <6h but allow same-day markets if they have clear momentum
+  if(days<0.10){
+    log.push("BLOCKED: resolves in <2.5h — no time to act");
     log.push("[DECISION] SKIP");
-    return {action:"SKIP",conf:0,amount:0,edgeFrom:"time",mType,log,reason:"Resolves <6h"};
+    return {action:"SKIP",conf:0,amount:0,edgeFrom:"time",mType,log,reason:"Resolves <2.5h"};
+  }
+  if(days<0.25&&Math.abs(market.oneDayChange||0)<0.05){
+    log.push("BLOCKED: resolves in <6h with no momentum — too risky");
+    log.push("[DECISION] SKIP");
+    return {action:"SKIP",conf:0,amount:0,edgeFrom:"time",mType,log,reason:"Resolves <6h, no momentum"};
   }
 
   const qual=calcQuality(market);
   const spr=market.bestBid&&market.bestAsk ? market.bestAsk-market.bestBid : null;
-  const sprStr=spr!=null?`${(spr*100).toFixed(1)}¢`:"?";
+  const sprStr=spr!=null?`${(spr*100).toFixed(1)}¢`:"N/A (Gamma price)";
 
   log.push(`[${mType.toUpperCase()}] "${market.question.slice(0,62)}"`);
   log.push(`Price:${pct(p)}  Vol:${mini(market.volume24h)}  Liq:${mini(market.liquidity)}  Qual:${qual}/100`);
-  if(spr!=null) log.push(`OrderBook: Bid:${market.bestBid?pct(market.bestBid):"?"}  Ask:${market.bestAsk?pct(market.bestAsk):"?"}  Spread:${sprStr}`);
-  log.push(`Resolves: ${days<1?`${Math.round(days*24)}h`:days<7?`${Math.round(days)}d`:days<30?`${Math.round(days/7)}wk`:`${Math.round(days/30)}mo`}  Articles: ${articles.length}`);
+  if(spr!=null) log.push(`OrderBook: Bid:${pct(market.bestBid)}  Ask:${pct(market.bestAsk)}  Spread:${sprStr}`);
+  else log.push(`Price source: Gamma API (CLOB unavailable)`);
+  const daysStr = days<0.5?`${Math.round(days*24)}h` : days<1?`${Math.round(days*24)}h` : days<7?`${Math.round(days)}d` : days<30?`${Math.round(days/7)}wk` : `${Math.round(days/30)}mo`;
+  log.push(`Resolves: ${daysStr}  Articles: ${articles.length}`);
   log.push("─".repeat(46));
 
   if(qual<25){
-    log.push(`[QUALITY] ${qual}/100 — below minimum (wide spread or no liquidity)`);
+    log.push(`[QUALITY] ${qual}/100 — too low (illiquid or very wide spread)`);
     log.push("[DECISION] SKIP");
-    return {action:"SKIP",conf:0,amount:0,edgeFrom:"quality",mType,log,reason:`Quality ${qual} too low`};
+    return {action:"SKIP",conf:0,amount:0,edgeFrom:"quality",mType,log,reason:`Quality ${qual}/100 too low`};
   }
 
   // Sentiment
   const sent=runSentiment(articles,market.question,mType);
   log.push(`[SENTIMENT] ${sent.label}  score:${sent.score}  relevant:${sent.relevant}/${articles.length}  rel:${(sent.totalRel*100).toFixed(0)}%`);
-  if(sent.bullHits.length) log.push(`  ↑ ${sent.bullHits.slice(0,5).join(", ")}`);
-  if(sent.bearHits.length) log.push(`  ↓ ${sent.bearHits.slice(0,5).join(", ")}`);
-  if(!articles.length)     log.push(`  ! No news — stat model only`);
-  else if(!sent.relevant)  log.push(`  ! ${articles.length} articles but none relevant to question`);
+  if(sent.bullHits.length) log.push(`  ↑ ${sent.bullHits.slice(0,6).join(", ")}`);
+  if(sent.bearHits.length) log.push(`  ↓ ${sent.bearHits.slice(0,6).join(", ")}`);
+  if(!articles.length)     log.push(`  ! No news found — statistical model only`);
+  else if(!sent.relevant)  log.push(`  ! Articles found but none relevant to this market`);
 
   // Momentum
   const mom=market.oneDayChange||0, wk=market.oneWeekChange||0;
-  log.push(`[MOMENTUM]  24h:${mom>0?"▲":"▼"}${(Math.abs(mom)*100).toFixed(2)}%  7d:${wk>=0?"+":""}${(wk*100).toFixed(1)}%`);
+  const momDir=mom>0.01?"▲":mom<-0.01?"▼":"─";
+  log.push(`[MOMENTUM]  24h:${momDir}${(Math.abs(mom)*100).toFixed(2)}%  7d:${wk>=0?"+":""}${(wk*100).toFixed(1)}%`);
+
+  // Volume surge — unusually high 24h volume vs liquidity can signal smart money
+  const volRatio = (market.volume24h||0) / Math.max(market.liquidity||1, 1);
+  let volSurge = false;
+  if(volRatio > 3 && (market.volume24h||0) > 50000){
+    volSurge = true;
+    log.push(`[VOL SURGE] ${volRatio.toFixed(1)}x churn — elevated activity detected`);
+  }
 
   // Statistical edge
   const stat=calcStatEdge(market,mType);
-  log.push(`[STAT EDGE] ${stat.action!=="SKIP"?`${stat.action}  edge:${(stat.edge*100).toFixed(1)}%  ${stat.reason}`:"No pattern"}`);
+  log.push(`[STAT EDGE] ${stat.action!=="SKIP"?`${stat.action}  edge:${(stat.edge*100).toFixed(1)}%  ${stat.reason}`:"No pattern detected"}`);
 
   // News edge
   const newsEdge=calcNewsEdge(p,sent);
   if(newsEdge.action!=="SKIP") log.push(`[NEWS EDGE] ${newsEdge.action}  edge:${(Math.abs(newsEdge.edge)*100).toFixed(1)}%  implied:${pct(newsEdge.implied)}`);
-  else log.push(`[NEWS EDGE] No significant edge`);
+  else log.push(`[NEWS EDGE] No significant edge from news`);
 
-  // ── CONFIDENCE — FIXED MATH ────────────────────────────────────────────────
-  // Base: mid-range gets higher base since there's more room to move
+  // ── CONFIDENCE ─────────────────────────────────────────────────────────────
+  // Base score by price range: mid-range = more room to move = more opportunity
   let conf = p>=0.25&&p<=0.75 ? 42 : p>=0.15&&p<=0.85 ? 36 : 28;
 
-  // Quality contribution: 0-18 pts (linear, q=100 → +18, q=50 → +9, q=25 → +4)
-  conf += Math.round(clamp(qual,0,100) * 0.18);
+  // Market quality (0-20 pts)
+  conf += Math.round(clamp(qual,0,100) * 0.20);
 
-  // --- SIGNAL BONUSES (flat bonuses per signal, not scaled by tiny strength values) ---
   let actionYesScore=0, actionNoScore=0;
 
-  // Stat signal: flat bonus based on whether we have a pattern, scaled by edge size
-  if(stat.action==="BUY_YES"){ conf+=12; actionYesScore+=12+Math.round(clamp(stat.edge*120,0,8)); }
-  if(stat.action==="BUY_NO") { conf+=12; actionNoScore +=12+Math.round(clamp(stat.edge*120,0,8)); }
-  conf += Math.round(clamp(stat.edge*120,0,8)); // edge magnitude bonus (0-8)
+  // Statistical signal — flat +12 bonus + edge magnitude
+  if(stat.action==="BUY_YES"){ conf+=12; actionYesScore+=12+Math.round(clamp(stat.edge*130,0,10)); }
+  if(stat.action==="BUY_NO") { conf+=12; actionNoScore +=12+Math.round(clamp(stat.edge*130,0,10)); }
+  conf += Math.round(clamp(stat.edge*130,0,10));
 
-  // News signal: flat bonus if we have relevant news edge
-  if(newsEdge.action==="BUY_YES"){ conf+=10; actionYesScore+=10+Math.round(clamp(Math.abs(newsEdge.edge)*80,0,8)); }
-  if(newsEdge.action==="BUY_NO") { conf+=10; actionNoScore +=10+Math.round(clamp(Math.abs(newsEdge.edge)*80,0,8)); }
-  conf += Math.round(clamp(Math.abs(newsEdge.edge)*80,0,8)); // edge magnitude bonus (0-8)
+  // News signal — flat +10 bonus + edge magnitude
+  if(newsEdge.action==="BUY_YES"){ conf+=10; actionYesScore+=10+Math.round(clamp(Math.abs(newsEdge.edge)*90,0,10)); }
+  if(newsEdge.action==="BUY_NO") { conf+=10; actionNoScore +=10+Math.round(clamp(Math.abs(newsEdge.edge)*90,0,10)); }
+  conf += Math.round(clamp(Math.abs(newsEdge.edge)*90,0,10));
 
-  // Sentiment signal (only if relevant articles exist)
-  if(sent.relevant>0 && Math.abs(sent.norm)>0.25){
-    const sentBonus=Math.round(clamp(Math.abs(sent.norm)*10,2,8));
-    conf+=sentBonus;
-    if(sent.norm>0.25)  actionYesScore+=sentBonus;
-    if(sent.norm<-0.25) actionNoScore +=sentBonus;
+  // Sentiment (only if relevant articles exist)
+  if(sent.relevant>0 && Math.abs(sent.norm)>0.20){
+    const sb=Math.round(clamp(Math.abs(sent.norm)*12,2,9));
+    conf+=sb;
+    if(sent.norm>0.20)  actionYesScore+=sb;
+    if(sent.norm<-0.20) actionNoScore +=sb;
   }
 
   // Momentum signal
-  if(Math.abs(mom)>0.06){
-    const momBonus=Math.round(clamp(Math.abs(mom)*60,3,7));
-    conf+=momBonus;
-    if(mom>0.06)  actionYesScore+=momBonus;
-    if(mom<-0.06) actionNoScore +=momBonus;
+  if(Math.abs(mom)>0.05){
+    const mb=Math.round(clamp(Math.abs(mom)*65,3,8));
+    conf+=mb;
+    if(mom>0.05)  actionYesScore+=mb;
+    if(mom<-0.05) actionNoScore +=mb;
   }
 
-  // Multi-signal agreement bonus (when 2+ sources agree = extra confidence)
-  const yesCount=[stat.action==="BUY_YES",newsEdge.action==="BUY_YES",sent.norm>0.25&&sent.relevant>0,mom>0.06].filter(Boolean).length;
-  const noCount =[stat.action==="BUY_NO", newsEdge.action==="BUY_NO", sent.norm<-0.25&&sent.relevant>0,mom<-0.06].filter(Boolean).length;
-  if(yesCount>=3||noCount>=3) conf+=10;
-  else if(yesCount>=2||noCount>=2) conf+=5;
+  // Weekly trend adds smaller bonus
+  if(Math.abs(wk)>0.08){
+    const wb=Math.round(clamp(Math.abs(wk)*30,1,5));
+    conf+=wb;
+    if(wk>0.08)  actionYesScore+=wb;
+    if(wk<-0.08) actionNoScore +=wb;
+  }
 
-  // Conflict penalty (signals pointing opposite directions)
+  // Volume surge bonus (smart money signal)
+  if(volSurge && Math.abs(mom)>0.03){
+    conf+=5;
+    if(mom>0) actionYesScore+=5; else actionNoScore+=5;
+  }
+
+  // Multi-signal agreement bonus
+  const yesCount=[stat.action==="BUY_YES",newsEdge.action==="BUY_YES",sent.norm>0.20&&sent.relevant>0,mom>0.05,wk>0.08].filter(Boolean).length;
+  const noCount =[stat.action==="BUY_NO", newsEdge.action==="BUY_NO", sent.norm<-0.20&&sent.relevant>0,mom<-0.05,wk<-0.08].filter(Boolean).length;
+  if(yesCount>=3||noCount>=3)      { conf+=12; }
+  else if(yesCount>=2||noCount>=2) { conf+=6;  }
+
+  // Conflict penalty
   if(yesCount>0&&noCount>0){
-    const conflictPenalty=Math.round(Math.min(yesCount,noCount)*8);
-    conf-=conflictPenalty;
-    actionYesScore-=conflictPenalty/2;
-    actionNoScore -=conflictPenalty/2;
-    log.push(`[CONFLICT]  YES signals:${yesCount} NO signals:${noCount} → penalty:-${conflictPenalty}`);
+    const pen=Math.round(Math.min(yesCount,noCount)*9);
+    conf-=pen; actionYesScore-=pen/2; actionNoScore-=pen/2;
+    log.push(`[CONFLICT]  YES:${yesCount} NO:${noCount} → penalty -${pen}`);
   }
 
-  // Time penalty
-  if(days<3)       conf-=10;
-  else if(days<7)  conf-=4;
-  else if(days>45) conf+=3;
+  // Time penalties/bonuses
+  if(days<0.5)      conf-=18;
+  else if(days<1)   conf-=12;
+  else if(days<3)   conf-=8;
+  else if(days<7)   conf-=3;
+  else if(days>60)  conf+=4;
+  else if(days>30)  conf+=2;
 
-  // Spread penalty (entry cost directly reduces expected profit)
+  // Spread cost penalty — the spread is money you lose on entry and exit
   if(spr!=null){
-    if(spr>0.10)      conf-=14;
-    else if(spr>0.06) conf-=8;
-    else if(spr>0.03) conf-=3;
-    else if(spr<0.01) conf+=4;
+    if(spr>0.12)       conf-=18;
+    else if(spr>0.08)  conf-=12;
+    else if(spr>0.04)  conf-=5;
+    else if(spr>0.02)  conf-=2;
+    else if(spr<0.01)  conf+=5; // tight spread = very liquid = reward it
   }
 
-  // ── ADAPTIVE LEARNING — adjust confidence based on historical performance ──
-  if (perfStats?.byType?.[mType]) {
-    const ts = perfStats.byType[mType];
-    const total = ts.wins + ts.losses;
-    if (total >= 3) {
-      const wr = ts.wins / total;
-      if (wr < 0.45) {
-        const pen = Math.round((0.45 - wr) * 50);
-        conf -= pen;
-        actionYesScore -= pen; actionNoScore -= pen;
-        log.push(`[LEARNING] ${mType} win rate low (${(wr*100).toFixed(0)}%) → -${pen} conf`);
-      } else if (wr > 0.55) {
-        const bon = Math.round((wr - 0.55) * 40);
-        conf += bon;
-        actionYesScore += bon; actionNoScore += bon;
-        log.push(`[LEARNING] ${mType} win rate high (${(wr*100).toFixed(0)}%) → +${bon} conf`);
+  // Adaptive learning from historical performance
+  if(perfStats?.byType?.[mType]){
+    const ts=perfStats.byType[mType];
+    const total=ts.wins+ts.losses;
+    if(total>=3){
+      const wr=ts.wins/total;
+      if(wr<0.40){
+        const pen=Math.round((0.40-wr)*55); conf-=pen;
+        actionYesScore-=pen; actionNoScore-=pen;
+        log.push(`[LEARNING] ${mType} win rate ${(wr*100).toFixed(0)}% → penalty -${pen}`);
+      } else if(wr>0.60){
+        const bon=Math.round((wr-0.60)*45); conf+=bon;
+        actionYesScore+=bon; actionNoScore+=bon;
+        log.push(`[LEARNING] ${mType} win rate ${(wr*100).toFixed(0)}% → bonus +${bon}`);
       }
     }
   }
 
   conf=clamp(Math.round(conf),0,99);
 
-  log.push(`[SIGNALS]   YES:${yesCount} NO:${noCount}  Qual:${qual}  Days:${days<1?`${(days*24).toFixed(0)}h`:Math.round(days)+"d"}`);
+  log.push(`[SIGNALS]   YES:${yesCount} NO:${noCount}  Qual:${qual}  Days:${daysStr}${volSurge?" VolSurge!":""}`);
   log.push("─".repeat(46));
   log.push(`[CONFIDENCE] ${conf}%  (threshold: ${CONF_THRESH}%)`);
 
-  // ── DIRECTION DECISION ─────────────────────────────────────────────────────
-  const isConflict = yesCount>0&&noCount>0;
+  // ── DECISION ───────────────────────────────────────────────────────────────
+  const isConflict=yesCount>0&&noCount>0;
   let action="SKIP", edgeFrom="none";
 
   if(conf>=CONF_THRESH && !isConflict){
     if(actionYesScore>actionNoScore && yesCount>0) action="BUY_YES";
     else if(actionNoScore>actionYesScore && noCount>0) action="BUY_NO";
   } else if(conf>=CONF_THRESH && isConflict){
-    log.push("[BLOCKED] Signals conflict — skipping to avoid coin-flip");
+    log.push("[BLOCKED] Conflicting signals — skipping to avoid coin-flip trade");
   }
 
   if(action!=="SKIP"){
     edgeFrom = newsEdge.action!=="SKIP"?"news" : stat.action!=="SKIP"?"statistical" : "momentum";
   }
 
-  // ── POSITION SIZING ────────────────────────────────────────────────────────
+  // ── KELLY-INSPIRED POSITION SIZING ─────────────────────────────────────────
   let amount=0;
   if(action!=="SKIP"){
     const maxScore=Math.max(actionYesScore,actionNoScore);
-    const base = maxScore>30?MAX_TRADE : maxScore>20?30 : maxScore>12?20 : 10;
-    const confScale = clamp((conf-CONF_THRESH)/25,0,1);
-    const raw = base*(0.6+confScale*0.4);
-    amount = clamp(r5(raw), 5, Math.min(MAX_TRADE, cash*0.15));
-    if(days<3) amount=Math.min(amount,10); // reduce size near expiry
+    const base = maxScore>35?MAX_TRADE : maxScore>25?30 : maxScore>15?20 : 10;
+    const confScale=clamp((conf-CONF_THRESH)/30,0,1);
+    const raw=base*(0.55+confScale*0.45);
+    amount=clamp(r5(raw), 5, Math.min(MAX_TRADE, cash*0.12));
+    // Reduce size for risky conditions
+    if(days<1)   amount=Math.min(amount, 10);
+    if(spr>0.04) amount=Math.min(amount, 20); // wide spread = smaller bet
   }
 
   if(action!=="SKIP")
     log.push(`[DECISION]  ✓ ${action}  $${amount}  Conf:${conf}%  Edge:${edgeFrom}  Y${yesCount}/N${noCount}`);
   else
-    log.push(`[DECISION]  SKIP  ${conf<CONF_THRESH?`conf:${conf}%<${CONF_THRESH}%`:isConflict?"conflict":"no dominant edge"}`);
+    log.push(`[DECISION]  SKIP  ${conf<CONF_THRESH?`conf ${conf}%<${CONF_THRESH}%`:isConflict?"conflicting signals":"no dominant edge"}`);
 
-  const srcList=action==="BUY_YES"
-    ?[stat.action==="BUY_YES"?"stat":"",newsEdge.action==="BUY_YES"?"news":"",sent.norm>0?"sent":""].filter(Boolean)
-    :[stat.action==="BUY_NO"?"stat":"",newsEdge.action==="BUY_NO"?"news":"",sent.norm<0?"sent":""].filter(Boolean);
+  const srcList=(action==="BUY_YES"
+    ?[stat.action==="BUY_YES"?"stat":"",newsEdge.action==="BUY_YES"?"news":"",sent.norm>0?"sent":""]
+    :[stat.action==="BUY_NO"?"stat":"",newsEdge.action==="BUY_NO"?"news":"",sent.norm<0?"sent":""]
+  ).filter(Boolean);
 
   return {
     action, conf, amount, edgeFrom, mType, qual, days, sent, stat, newsEdge, spr,
     signals:{yesCount,noCount,isConflict,actionYesScore,actionNoScore},
     log,
     reason: action!=="SKIP"
-      ? `[${mType}] ${sent.label}|${stat.reason.slice(0,35)}|src:${srcList.join("+")}`
+      ? `[${mType}] ${sent.label} | ${stat.reason.slice(0,38)} | ${srcList.join("+")}`
       : `[${mType}] ${conf<CONF_THRESH?`conf:${conf}%`:isConflict?"conflicted":"no edge"}`,
   };
 }
@@ -805,6 +857,9 @@ export default function App(){
   const [tab,        setTab]       = useState("positions");
   const [aiStatus,   setAiStatus]  = useState("Initializing...");  // live AI commentary
   const [diag,       setDiag]      = useState(null);               // diagnostics result
+  // Cooldown tracker — markets skipped repeatedly get temporarily excluded
+  const skipCountRef = useRef({});  // { id: skipCount }
+  const cooldownRef  = useRef({});  // { id: expiresAtMs }
   const [leaders,    setLeaders]   = useState([]);
   const [lbPeriod,   setLbPeriod]  = useState("WEEK");
   const [lbOrder,    setLbOrder]   = useState("PNL");
@@ -955,7 +1010,7 @@ export default function App(){
     setAiStatus(getRandMsg("scanning"));
     sl("","blank"); sl("▶ New scan cycle","header");
 
-    const raw=await fetchMarkets(100);
+    const raw=await fetchMarkets(150);
     setStats(s=>({...s,scans:s.scans+1,lastScan:nowTs()}));
 
     if(!raw.length){
@@ -976,25 +1031,49 @@ export default function App(){
 
     setAiStatus(getRandMsg("filtering"));
 
-    // score & sort — prefer mid-range, high volume, tight spread
-    const scored=alive.filter(m=>(m.volume24h||0)>=200).map(m=>{
+    // Expire cooldowns that have passed
+    const nowMs = Date.now();
+    Object.keys(cooldownRef.current).forEach(id => {
+      if(cooldownRef.current[id] < nowMs) {
+        delete cooldownRef.current[id];
+        delete skipCountRef.current[id];
+      }
+    });
+    const cooledDown = new Set(Object.keys(cooldownRef.current));
+    if(cooledDown.size > 0) sl(`Cooling down ${cooledDown.size} stale market(s) — seen & skipped repeatedly`,"dim");
+
+    // Score & sort — multi-factor: volume, price range, spread, momentum, days left
+    const scored=alive.filter(m=>(m.volume24h||0)>=300 && !cooledDown.has(m.id)).map(m=>{
       let s=m.volume24h||0;
       const p=m.yesPrice;
-      if(p>=0.30&&p<=0.70) s*=2.2; else if(p>=0.20&&p<=0.80) s*=1.5;
-      if(m.bestBid&&m.bestAsk&&(m.bestAsk-m.bestBid)<0.03) s*=1.6;
-      if(Math.abs(m.oneDayChange||0)>0.04) s*=1.3;
-      return {...m,_score:s};
+      const days=daysFrom(m.endDate);
+      // Price range bonus: mid-range = most opportunity
+      if(p>=0.30&&p<=0.70) s*=2.5; else if(p>=0.20&&p<=0.80) s*=1.6; else s*=0.7;
+      // Tight spread bonus (means liquid, low cost to enter)
+      if(m.bestBid&&m.bestAsk){
+        const spr=m.bestAsk-m.bestBid;
+        if(spr<0.02) s*=2.0; else if(spr<0.04) s*=1.5; else if(spr>0.08) s*=0.4;
+      }
+      // Momentum bonus (something is happening)
+      if(Math.abs(m.oneDayChange||0)>0.06) s*=1.5;
+      else if(Math.abs(m.oneDayChange||0)>0.03) s*=1.2;
+      // Penalize markets ending very soon (already in final hours)
+      if(days<0.25) s*=0.1;
+      else if(days<1) s*=0.6;
+      else if(days>30) s*=1.1; // long-dated = more time for edge to play out
+      return {...m, _score:s, _days:days};
     }).sort((a,b)=>b._score-a._score);
 
     setMarkets(raw);
-    sl(`${raw.length} fetched → ${scored.length} valid → analyzing top 8`,"ok");
-    setStats(s=>({...s,analyzed:s.analyzed+Math.min(8,scored.length)}));
+    const analyzeCap=Math.min(10, scored.length);
+    sl(`${raw.length} fetched → ${scored.length} valid → analyzing top ${analyzeCap}`,"ok");
+    setStats(s=>({...s,analyzed:s.analyzed+analyzeCap}));
 
     const tradedIds=new Set();
     const openSlots=MAX_OPEN-portRef.current.positions.filter(p=>p.status==="OPEN").length;
     if(openSlots<=0){sl("Max open positions reached — skipping analysis","warn");setStatus("idle");return;}
 
-    for(let i=0;i<Math.min(8,scored.length);i++){
+    for(let i=0;i<analyzeCap;i++){
       const m=scored[i]; setStatus("thinking");
 
       // dedup
@@ -1004,7 +1083,7 @@ export default function App(){
       }
 
       const tag=m.yesPrice>=0.30&&m.yesPrice<=0.70?"MID":m.yesPrice>=0.15&&m.yesPrice<=0.85?"SIDE":"EDGE";
-      sl(`[${i+1}/8] [${tag}] ${m.question.slice(0,60)}`,"mkt");
+      sl(`[${i+1}/${analyzeCap}] [${tag}] ${m.question.slice(0,60)}`,"mkt");
       sl(`  YES:${pct(m.yesPrice)}  Vol:${mini(m.volume24h)}  Δ24h:${((m.oneDayChange||0)*100).toFixed(1)}%`,"dim");
       setAiStatus(getRandMsg("analyzing_start"));
 
@@ -1085,6 +1164,9 @@ export default function App(){
         };
         setPortfolio(prev=>{const next={...prev,cash:prev.cash-result.amount,positions:[...prev.positions,trade],trades:[...prev.trades,trade]};portRef.current=next;return next;});
         tradedIds.add(key);
+        // Reset skip count — market was tradeable
+        delete skipCountRef.current[m.id];
+        delete cooldownRef.current[m.id];
         sl(`  ✓ BUY ${side} ${dollar(result.amount)} @ ${pct(ep)} → ${shares.toFixed(3)} shares  max:${dollar(maxProfit)}`,"tradeok");
         sys(`[TRADE] BUY ${side} ${dollar(result.amount)} @ ${pct(ep)} [${result.mType}/${result.edgeFrom}] conf:${result.conf}% "${m.question.slice(0,28)}"`,"tradeok");
         setStats(s=>({...s,executed:s.executed+1,byType:{...s.byType,[result.mType]:(s.byType[result.mType]||0)+1},byEdge:{...s.byEdge,[result.edgeFrom]:(s.byEdge[result.edgeFrom]||0)+1},confHistory:[...s.confHistory.slice(-29),result.conf],avgConf:Math.round([...s.confHistory,result.conf].reduce((a,b)=>a+b,0)/(s.confHistory.length+1))}));
@@ -1093,7 +1175,46 @@ export default function App(){
         setStats(s=>({...s,skipped:s.skipped+1}));
         const skipMsg = result.signals?.isConflict ? getRandMsg("skip_conflict") : getRandMsg("skip_low_conf");
         setAiStatus(skipMsg);
-        if(result.conf<38&&!nr.articles.length&&Math.abs(m.oneDayChange||0)<0.003){bl.add(m.id);setBlacklist(new Set(bl));blackRef.current=new Set(bl);}
+
+        // Track consecutive failures per market
+        const sc = (skipCountRef.current[m.id] || 0) + 1;
+        skipCountRef.current[m.id] = sc;
+        const gap = CONF_THRESH - result.conf; // how far below threshold
+
+        if(sc >= 3) {
+          // 3 strikes: permanently blacklist — this market clearly has no edge
+          bl.add(m.id); setBlacklist(new Set(bl)); blackRef.current = new Set(bl);
+          delete skipCountRef.current[m.id];
+          delete cooldownRef.current[m.id];
+          sl(`  ✗ BLACKLISTED after ${sc} attempts (conf stuck at ${result.conf}%) — freeing scan slot`,"warn");
+          setStats(s=>({...s,blacklisted:bl.size}));
+
+        } else if(sc >= 2 || gap > 8) {
+          // 2nd failure OR far below threshold → long cooldown (skip 10 scan cycles = ~30min)
+          const coolMs = SCAN_MS * 10;
+          cooldownRef.current[m.id] = Date.now() + coolMs;
+          sl(`  ⏸ Cooling down ~30min (attempt ${sc}, conf:${result.conf}%, gap:${gap}pts)`,"warn");
+
+        } else {
+          // 1st failure → short cooldown (skip 4 cycles = ~12min)
+          const coolMs = SCAN_MS * 4;
+          cooldownRef.current[m.id] = Date.now() + coolMs;
+          sl(`  ⏸ Cooling down ~12min (attempt ${sc}, conf:${result.conf}%)`,"dim");
+        }
+
+        // Also hard-blacklist markets with zero signals and zero momentum regardless of attempts
+        const totallyDead = result.conf < 46
+          && result.signals?.yesCount === 0
+          && result.signals?.noCount === 0
+          && Math.abs(m.oneDayChange||0) < 0.005
+          && Math.abs(m.oneWeekChange||0) < 0.005;
+        if(totallyDead){
+          bl.add(m.id); setBlacklist(new Set(bl)); blackRef.current = new Set(bl);
+          delete skipCountRef.current[m.id];
+          delete cooldownRef.current[m.id];
+          sl(`  ✗ BLACKLISTED: zero signals + zero momentum — nothing to trade`,"warn");
+          setStats(s=>({...s,blacklisted:bl.size}));
+        }
       }
       sl("","blank"); await sleep(80);
     }
@@ -1303,7 +1424,7 @@ export default function App(){
                     <button onClick={()=>refreshPrices(false)} style={{marginLeft:"auto",background:"transparent",border:"1px solid #2a4a2a",color:"#4a7a4a",padding:"1px 8px",fontSize:"9px",fontFamily:"Consolas,monospace",cursor:"pointer"}}>REFRESH NOW</button>
                   </div>
                   <table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
-                    <TH cols={["#","Type","Market","Side","Entry","Bid","Ask","Spr","Current","Δ¢","P&L","P&L%","Cost","Value","Max$","Conf","Days","Src","Updated"]}/>
+                    <TH cols={["#","Type","Market","Side","Entry","Bid","Ask","Spr","Current","Δ¢","P&L","P&L%","Cost","Value","Max$","Conf","Days","Src","Close"]}/>
                     <tbody>
                       {open.map((pos,i)=>{
                         const pc=pos.pnl||0, diff=(pos.currentPrice||pos.ep)-pos.ep;
@@ -1329,7 +1450,12 @@ export default function App(){
                             <td style={{padding:"4px 8px"}}><ConfBar conf={pos.conf}/></td>
                             <td style={{padding:"4px 8px",color:days<3?"#8a5a5a":"#333",fontSize:"9px"}}>{days<1?`${(days*24).toFixed(0)}h`:Math.round(days)+"d"}</td>
                             <td style={{padding:"4px 8px",color:"#555",fontSize:"9px"}}>{pos.priceSource}</td>
-                            <td style={{padding:"4px 8px",color:"#555",fontSize:"9px"}}>{pos.lastUpdate}</td>
+                            <td style={{padding:"4px 6px"}}>
+                              <button onClick={()=>closePos({...pos,currentPrice:pos.currentPrice||pos.ep,pnl:pos.pnl||0,pnlPct:pos.pnlPct||0},"MANUAL")}
+                                style={{background:"transparent",border:"1px solid #5a3a3a",color:"#cc7a7a",padding:"2px 7px",fontSize:"9px",fontFamily:"Consolas,monospace",cursor:"pointer",whiteSpace:"nowrap"}}>
+                                CLOSE
+                              </button>
+                            </td>
                           </tr>
                         );
                       })}
