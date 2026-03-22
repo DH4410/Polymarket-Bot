@@ -6,7 +6,12 @@ import { useState, useEffect, useRef, useCallback } from "react";
 // ═══════════════════════════════════════════════════════════════════════════════
 const THENEWS_KEY  = "GzCg1YdRg2mxy6OJ7XQgk2UNZwV9Pq7XNbDnuLKv";
 const GNEWS_KEY    = "9e1ef6ca6dd91d2708f9b476b72cdd22";
-const CORS         = "https://corsproxy.io/?url=";
+// Multiple CORS proxies — tries each in order, uses first that works
+const CORS_PROXIES = [
+  url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  url => `https://corsproxy.org/?${encodeURIComponent(url)}`,
+];
 const START_CASH   = 1000;
 const PRICE_MS     = 10000;
 const SCAN_MS      = 180000;
@@ -15,7 +20,7 @@ const MAX_TRADE    = 40;
 const PRICE_MIN    = 0.08;
 const PRICE_MAX    = 0.92;
 const MAX_OPEN     = 8;     // max simultaneous positions
-const VERSION      = "10.0";
+const VERSION      = "11.0";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UTILITIES
@@ -35,12 +40,15 @@ const daysFrom = dt  => dt ? (new Date(dt)-Date.now())/(864e5) : 999;
 // ═══════════════════════════════════════════════════════════════════════════════
 // API LAYER
 // ═══════════════════════════════════════════════════════════════════════════════
+// Tries each CORS proxy in order — falls back automatically if one is down
 async function apiFetch(url, ms=8000) {
-  try {
-    const r = await fetch(CORS+encodeURIComponent(url), {signal:AbortSignal.timeout(ms)});
-    if(!r.ok) return null;
-    return await r.json();
-  } catch(_e){ return null; }
+  for (const makeProxy of CORS_PROXIES) {
+    try {
+      const r = await fetch(makeProxy(url), {signal:AbortSignal.timeout(ms)});
+      if (r.ok) return await r.json();
+    } catch(_e){ /* try next proxy */ }
+  }
+  return null;
 }
 async function rawFetch(url, ms=5000) {
   try {
@@ -72,25 +80,47 @@ async function fetchMarkets(limit=100) {
   });
 }
 
+// Detect sentinel "dead book" response: CLOB returns bid≈0.01/ask≈0.99 for illiquid/resolved markets
+function isDeadBook(bid, ask) {
+  if (!bid || !ask) return true;
+  const spread = ask - bid;
+  // A 90%+ spread is not a real market — it's the CLOB sentinel value
+  if (spread > 0.85) return true;
+  // bid < 2% or ask > 98% = no real liquidity
+  if (bid < 0.02 || ask > 0.98) return true;
+  return false;
+}
+
 async function getLivePrice(yesId, conditionId) {
-  // 1. CLOB order book (best)
-  for(const fetcher of [rawFetch, u=>apiFetch(u,4000)]) {
+  // 1. Try CLOB order book directly, then via proxy
+  for (const fetcher of [rawFetch, u => apiFetch(u, 4000)]) {
     const book = await fetcher(`https://clob.polymarket.com/book?token_id=${yesId}`, 4000);
-    if(book?.bids?.length||book?.asks?.length) {
+    if (book?.bids?.length || book?.asks?.length) {
       const bid = book.bids?.[0]?.price ? +book.bids[0].price : null;
       const ask = book.asks?.[0]?.price ? +book.asks[0].price : null;
-      const mid = bid&&ask?(bid+ask)/2 : bid||ask;
-      if(mid&&mid>0&&mid<1) return {price:mid, bid, ask, spread:ask&&bid?ask-bid:null, depth:book.bids?.length+book.asks?.length, source:"orderbook"};
+      // Skip dead/sentinel books — fall through to Gamma
+      if (isDeadBook(bid, ask)) break;
+      const mid = bid && ask ? (bid + ask) / 2 : bid || ask;
+      if (mid && mid > 0 && mid < 1) {
+        return { price: mid, bid, ask, spread: ask - bid, source: "orderbook" };
+      }
     }
   }
-  // 2. CLOB midpoint
+
+  // 2. CLOB midpoint endpoint
   const mp = await rawFetch(`https://clob.polymarket.com/midpoint?token_id=${yesId}`, 3000);
-  if(mp?.mid&&+mp.mid>0&&+mp.mid<1) return {price:+mp.mid, bid:null, ask:null, spread:null, source:"clob-mid"};
-  // 3. Gamma fallback
+  if (mp?.mid && +mp.mid > 0 && +mp.mid < 1) {
+    return { price: +mp.mid, bid: null, ask: null, spread: null, source: "clob-mid" };
+  }
+
+  // 3. Gamma API — always works, used as reliable fallback
   const gm = await apiFetch(`https://gamma-api.polymarket.com/markets/${conditionId}`, 5000);
-  if(gm?.outcomePrices) {
-    try{ const p=JSON.parse(gm.outcomePrices); const v=+p[0]; if(v>0&&v<1) return {price:v,bid:null,ask:null,spread:null,source:"gamma"}; }
-    catch(_e){}
+  if (gm?.outcomePrices) {
+    try {
+      const prices = JSON.parse(gm.outcomePrices);
+      const v = +prices[0];
+      if (v > 0 && v < 1) return { price: v, bid: null, ask: null, spread: null, source: "gamma" };
+    } catch (_e) { /* ignore */ }
   }
   return null;
 }
@@ -290,7 +320,7 @@ function calcNewsEdge(price, sent) {
 }
 
 // ── MAIN ANALYSIS ──
-function analyzeMarket(market, articles, cash) {
+function analyzeMarket(market, articles, cash, perfStats = null) {
   const log=[]; const mType=detectType(market.question); const p=market.yesPrice;
 
   // Hard blocks
@@ -407,6 +437,26 @@ function analyzeMarket(market, articles, cash) {
     else if(spr<0.01) conf+=4;
   }
 
+  // ── ADAPTIVE LEARNING — adjust confidence based on historical performance ──
+  if (perfStats?.byType?.[mType]) {
+    const ts = perfStats.byType[mType];
+    const total = ts.wins + ts.losses;
+    if (total >= 3) {
+      const wr = ts.wins / total;
+      if (wr < 0.45) {
+        const pen = Math.round((0.45 - wr) * 50);
+        conf -= pen;
+        actionYesScore -= pen; actionNoScore -= pen;
+        log.push(`[LEARNING] ${mType} win rate low (${(wr*100).toFixed(0)}%) → -${pen} conf`);
+      } else if (wr > 0.55) {
+        const bon = Math.round((wr - 0.55) * 40);
+        conf += bon;
+        actionYesScore += bon; actionNoScore += bon;
+        log.push(`[LEARNING] ${mType} win rate high (${(wr*100).toFixed(0)}%) → +${bon} conf`);
+      }
+    }
+  }
+
   conf=clamp(Math.round(conf),0,99);
 
   log.push(`[SIGNALS]   YES:${yesCount} NO:${noCount}  Qual:${qual}  Days:${days<1?`${(days*24).toFixed(0)}h`:Math.round(days)+"d"}`);
@@ -475,6 +525,12 @@ function evalSell(pos, currentPrice, mom=0) {
   if(currentPrice>0.90&&pos.side==="NO") {score+=50;steps.push("NO: market against position");}
   if(pos.side==="YES"&&mom<-0.06){score+=12;steps.push(`Adverse momentum ${(mom*100).toFixed(1)}%`);}
   if(pos.side==="NO" &&mom> 0.06){score+=12;steps.push(`Adverse momentum +${(mom*100).toFixed(1)}%`);}
+
+  // Dead money: position open 48h+ and totally flat → free up capital
+  const hoursOpen = (Date.now() - (pos.openedTs||0)) / 3600000;
+  if (hoursOpen > 48 && (pos.pnlPct||0) > -0.05 && (pos.pnlPct||0) < 0.05) {
+    score += 60; steps.push("DEAD MONEY: 48h+ flat — reallocating capital");
+  }
   const dec=score>=55?"SELL":score>=28?"CONSIDER":"HOLD";
   steps.push(`Score: ${score}/100  →  ${dec}`);
   return {decision:dec,score,steps,pnlPct};
@@ -538,7 +594,7 @@ function ConfBar({conf,threshold=CONF_THRESH,width=60}){
 }
 
 function MiniSpark({data,w=70,h=20,color="#4a7a4a"}){
-  if(!data||data.length<2) return <span style={{color:"#1e1e1e",fontSize:"9px"}}>─</span>;
+  if(!data||data.length<2) return <span style={{color:"#666",fontSize:"9px"}}>─</span>;
   const vals=data.map(d=>typeof d==="number"?d:(d.price??d.y??0));
   const mn=Math.min(...vals),mx=Math.max(...vals),rng=mx-mn||0.001;
   const pts=vals.map((v,i)=>`${((i/(vals.length-1))*w).toFixed(1)},${(h-((v-mn)/rng)*h).toFixed(1)}`).join(" ");
@@ -554,7 +610,7 @@ function LogPanel({logs,logRef}){
     <div ref={logRef} style={{flex:1,overflowY:"auto",padding:"6px 8px",fontSize:"11px",lineHeight:"1.6",fontFamily:"Consolas,monospace"}}>
       {logs.map(l=>{
         if(l.type==="blank") return <div key={l.id} style={{height:"5px"}}/>;
-        if(l.type==="div")   return <div key={l.id} style={{color:"#222",fontSize:"9px",paddingLeft:"2px"}}>{"─".repeat(54)}</div>;
+        if(l.type==="div")   return <div key={l.id} style={{color:"#555",fontSize:"9px",paddingLeft:"2px"}}>{"─".repeat(54)}</div>;
         return(
           <div key={l.id} style={{display:"flex",gap:"8px"}}>
             <span style={{color:"#1c1c1c",flexShrink:0,fontSize:"9px",paddingTop:"1px",minWidth:"52px"}}>{l.ts}</span>
@@ -571,7 +627,7 @@ function PBar({title,badge,actions=[]}){
   return(
     <div style={{flexShrink:0,background:"#0d0d0d",borderBottom:"1px solid #1c1c1c",padding:"5px 10px",display:"flex",alignItems:"center",gap:"8px"}}>
       <span style={{color:"#555",fontSize:"10px",letterSpacing:"1px",fontWeight:"bold"}}>{title}</span>
-      {badge&&<span style={{color:"#252525",fontSize:"9px"}}>{badge}</span>}
+      {badge&&<span style={{color:"#555",fontSize:"9px"}}>{badge}</span>}
       <div style={{marginLeft:"auto",display:"flex",gap:"4px"}}>
         {actions.map(a=>(
           <button key={a.label} onClick={a.fn} disabled={a.dis} style={{background:"transparent",border:`1px solid ${a.dis?"#1a1a1a":"#333"}`,color:a.dis?"#222":"#666",padding:"2px 10px",fontSize:"10px",fontFamily:"Consolas,monospace",cursor:a.dis?"not-allowed":"pointer"}}>{a.label}</button>
@@ -590,20 +646,20 @@ function Panel({title,badge,actions,children,style={}}){
   );
 }
 
-function SVal({label,value,color="#777",sub=null,hi=false}){
+function SVal({label,value,color="#aaa",sub=null,hi=false}){
   return(
     <div style={{padding:"6px 12px",borderBottom:"1px solid #0f0f0f",background:hi?"#0a120a":"transparent"}}>
-      <div style={{color:"#1e1e1e",fontSize:"9px",marginBottom:"2px",letterSpacing:"0.3px"}}>{label}</div>
+      <div style={{color:"#666",fontSize:"9px",marginBottom:"2px",letterSpacing:"0.5px"}}>{label}</div>
       <div style={{color,fontSize:"14px",fontWeight:"bold"}}>{value}</div>
-      {sub&&<div style={{color:"#1a1a1a",fontSize:"9px",marginTop:"1px"}}>{sub}</div>}
+      {sub&&<div style={{color:"#555",fontSize:"9px",marginTop:"1px"}}>{sub}</div>}
     </div>
   );
 }
 
-function SRow({label,value,color="#333"}){
+function SRow({label,value,color="#888"}){
   return(
     <div style={{display:"flex",justifyContent:"space-between",padding:"2px 12px",borderBottom:"1px solid #0a0a0a",fontSize:"10px"}}>
-      <span style={{color:"#222"}}>{label}</span><span style={{color}}>{value}</span>
+      <span style={{color:"#555"}}>{label}</span><span style={{color}}>{value}</span>
     </div>
   );
 }
@@ -612,15 +668,133 @@ function TH({cols}){
   return(
     <thead>
       <tr style={{borderBottom:"1px solid #181818"}}>
-        {cols.map(c=><th key={c} style={{padding:"4px 8px",textAlign:"left",fontWeight:"normal",color:"#2a2a2a",fontSize:"10px",whiteSpace:"nowrap"}}>{c}</th>)}
+        {cols.map(c=><th key={c} style={{padding:"4px 8px",textAlign:"left",fontWeight:"normal",color:"#666",fontSize:"10px",whiteSpace:"nowrap"}}>{c}</th>)}
       </tr>
     </thead>
   );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MAIN APP
+// PRE-FLIGHT DIAGNOSTICS
 // ═══════════════════════════════════════════════════════════════════════════════
+async function runDiagnostics() {
+  const t0 = Date.now();
+  const r = { internet: false, gamma: false, clob: false, news: false, ping: 0, clobNote: "" };
+  // Internet + Gamma
+  try {
+    const d = await rawFetch("https://gamma-api.polymarket.com/markets?limit=1&active=true", 4000);
+    if (d) { r.internet = true; r.gamma = true; }
+  } catch (_e) {}
+  // CLOB
+  try {
+    const d = await rawFetch("https://clob.polymarket.com/time", 3000);
+    if (d) { r.clob = true; } else { r.clobNote = "CLOB unreachable — will use Gamma prices"; }
+  } catch (_e) { r.clobNote = "CLOB blocked — will use Gamma prices"; }
+  // News (TheNewsAPI)
+  try {
+    const d = await fetch("https://api.thenewsapi.com/v1/news/all?api_token="+THENEWS_KEY+"&search=test&limit=1", { signal: AbortSignal.timeout(3000) });
+    if (d.ok) r.news = true;
+  } catch (_e) {}
+  r.ping = Date.now() - t0;
+  return r;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AI STATUS MESSAGES — varied, human-feeling commentary
+// ═══════════════════════════════════════════════════════════════════════════════
+const STATUS_MSGS = {
+  scanning: [
+    "Pulling latest markets from Polymarket...",
+    "Fetching market data, stand by...",
+    "Scanning 100 markets for opportunities...",
+    "Connecting to Polymarket Gamma API...",
+    "Loading market feed...",
+  ],
+  filtering: [
+    "Filtering out dead and illiquid markets...",
+    "Removing markets outside tradeable range...",
+    "Pruning low-quality candidates...",
+    "Sorting candidates by volume and spread quality...",
+  ],
+  analyzing_start: [
+    "Locking on to candidate market...",
+    "Running pre-trade analysis...",
+    "Inspecting market microstructure...",
+    "Pulling order book depth...",
+    "Checking live bid/ask from CLOB...",
+  ],
+  news_searching: [
+    "Searching for relevant news...",
+    "Querying TheNewsAPI for recent coverage...",
+    "Looking for market-relevant articles...",
+    "Scanning news sources for signal...",
+    "Fetching real-time news context...",
+  ],
+  news_found: [
+    "Found relevant articles — analyzing sentiment...",
+    "News found — running NLP sentiment pass...",
+    "Got {n} article(s) — scoring relevance...",
+    "Articles found — checking keyword alignment...",
+  ],
+  news_none: [
+    "No news found — falling back to statistical model.",
+    "No articles. Using price action and stat patterns only.",
+    "News API dry — relying on quant signals.",
+    "Can't find relevant news — stat model stepping in.",
+  ],
+  thinking: [
+    "Running multi-signal analysis...",
+    "Weighing news edge vs statistical edge...",
+    "Checking for signal agreement...",
+    "Calculating confidence score...",
+    "Running favourite-longshot bias check...",
+    "Comparing implied probability vs current price...",
+    "Assessing market quality and spread cost...",
+    "Cross-referencing all signal sources...",
+  ],
+  interesting: [
+    "Interesting setup here — digging deeper...",
+    "This market has potential — running full analysis...",
+    "Signals looking promising on this one...",
+    "Something catching my eye here...",
+    "Worth a closer look — analyzing...",
+  ],
+  skip_low_conf: [
+    "Edge too thin — skipping.",
+    "Not enough conviction — moving on.",
+    "Confidence below threshold — no trade.",
+    "Signals weak, staying out.",
+    "Risk/reward not there — skipping.",
+  ],
+  skip_conflict: [
+    "Conflicting signals — too uncertain, skipping.",
+    "Bull and bear signals cancelling out — no trade.",
+    "Mixed picture. Won't trade without clarity.",
+    "Signals pointing both ways — I'll wait.",
+  ],
+  trade_found: [
+    "Edge identified — executing paper trade...",
+    "Strong signal detected. Entering position...",
+    "Conviction high — deploying capital...",
+    "Found an edge worth trading — going in.",
+    "All signals aligned — opening position now.",
+  ],
+  idle_waiting: [
+    "Watching the markets...",
+    "Waiting for the next scan cycle...",
+    "Resting between scans. Auto mode active.",
+    "Monitoring. Next deep scan in ~3 minutes.",
+    "All quiet. Prices updating every 10 seconds.",
+  ],
+};
+
+function getRandMsg(key, replacements = {}) {
+  const pool = STATUS_MSGS[key];
+  if (!pool) return "";
+  let msg = pool[Math.floor(Math.random() * pool.length)];
+  Object.entries(replacements).forEach(([k, v]) => { msg = msg.replace("{"+k+"}", v); });
+  return msg;
+}
 export default function App(){
   // ── state ──
   const [markets,    setMarkets]   = useState([]);
@@ -629,6 +803,8 @@ export default function App(){
   const [status,     setStatus]    = useState("idle");
   const [auto,       setAuto]      = useState(false);
   const [tab,        setTab]       = useState("positions");
+  const [aiStatus,   setAiStatus]  = useState("Initializing...");  // live AI commentary
+  const [diag,       setDiag]      = useState(null);               // diagnostics result
   const [leaders,    setLeaders]   = useState([]);
   const [lbPeriod,   setLbPeriod]  = useState("WEEK");
   const [lbOrder,    setLbOrder]   = useState("PNL");
@@ -728,24 +904,47 @@ export default function App(){
     if(bootRef.current) return; bootRef.current=true;
     (async()=>{
       await sleep(80);
-      sys(`PolyBot v${VERSION}  ─  Multi-Signal AI  ─  Fixed Confidence Math`,"header");
+      sys(`PolyBot v${VERSION}  ─  Adaptive Learning  ─  Smart Skipping`,"header");
       sys("─────────────────────────────────────────────────────","div");
-      await sleep(100);
-      sys("[OK] Polymarket Gamma API","ok");
-      await sleep(60); sys("[OK] CLOB Order Book (real bid/ask/spread)","ok");
-      await sleep(60); sys("[OK] Data API (leaderboard + wallets)","ok");
-      await sleep(60); sys("[OK] TheNewsAPI + GNews (news fallback)","ok");
-      await sleep(60); sys("[OK] AI Engine v4 (fixed confidence math)","ok");
-      await sleep(60); sys("[OK] Performance tracker (learns from outcomes)","ok");
-      await sleep(60); sys("[OK] Price refresh every 10s","ok");
+      setAiStatus("Running pre-flight diagnostics...");
+      sys("[DIAG] Running pre-flight diagnostics...","info");
+      await sleep(200);
+
+      const d = await runDiagnostics();
+      setDiag(d);
+
+      sys(`[DIAG] Ping: ${d.ping}ms  |  Internet: ${d.internet?"✓ OK":"✗ FAIL"}`, d.internet?"ok":"err");
+      sys(`[DIAG] Gamma API:  ${d.gamma?"✓ ONLINE":"✗ OFFLINE — cannot fetch markets"}`, d.gamma?"ok":"err");
+      sys(`[DIAG] CLOB API:   ${d.clob?"✓ ONLINE":"✗ BLOCKED — using Gamma price fallback"}`, d.clob?"ok":"warn");
+      sys(`[DIAG] News API:   ${d.news?"✓ ONLINE":"✗ UNAVAILABLE — GNews backup active"}`, d.news?"ok":"warn");
+      sys("─────────────────────────────────────────────────────","div");
+
+      if (!d.internet || !d.gamma) {
+        sys("[FATAL] Cannot reach Polymarket. Check your internet connection.","err");
+        setAiStatus("No internet connection. Cannot start.");
+        sl("ERROR: No connection to Polymarket. Check your network.","err");
+        return;
+      }
+
+      if (!d.clob) {
+        sys("[NOTE] CLOB blocked. Dead order books (Bid:1%/Ask:99%) will be detected and skipped.","warn");
+        sys("[NOTE] Bot will use Gamma API prices — fully functional, just no bid/ask spread data.","info");
+      }
+
+      await sleep(60); sys("[OK] Markets: Polymarket Gamma API","ok");
+      await sleep(60); sys(`[OK] Prices: ${d.clob?"CLOB Order Book (real bid/ask)":"Gamma API (CLOB unavailable)"}`, d.clob?"ok":"warn");
+      await sleep(60); sys("[OK] Leaderboard + Wallet: Data API","ok");
+      await sleep(60); sys("[OK] AI Engine v11 — adaptive RL, dead-money detection","ok");
+      await sleep(60); sys("[OK] Performance tracker — learns from trade outcomes","ok");
+      await sleep(60); sys("[OK] Price refresh: every 10s","ok");
       await sleep(60); sys("[OK] Paper wallet: $1,000.00 USDC","ok");
       sys("─────────────────────────────────────────────────────","div");
-      sys(`Threshold: ${CONF_THRESH}%  |  Price: ${pct(PRICE_MIN)}-${pct(PRICE_MAX)}  |  MaxPos: ${MAX_OPEN}`,"info");
-      sys("Scan: 3min  |  Refresh: 10s  |  MaxTrade: $"+MAX_TRADE,"info");
-      sys("Confidence audit: stat-only → ~73%  no-signal → ~49%","info");
+      sys(`Settings: Threshold ${CONF_THRESH}%  |  Price ${pct(PRICE_MIN)}-${pct(PRICE_MAX)}  |  Max ${MAX_OPEN} positions  |  Max $${MAX_TRADE}/trade`,"info");
+      sys("All systems nominal. Click SCAN or AUTO to begin.","ok");
       sl("Scanner ready. Click SCAN or AUTO.","dim");
-      al(`AI Engine v4 ready. Threshold: ${CONF_THRESH}%. Single stat signal → ~73%.`,"dim");
+      al("AI Engine v11 ready. Confidence threshold: "+CONF_THRESH+"%. RL feedback active.","dim");
       sel("Position monitor ready.","dim");
+      setAiStatus("Ready. Waiting for scan.");
     })();
   },[sys,sl,al,sel]);
 
@@ -753,6 +952,7 @@ export default function App(){
   const scan=useCallback(async()=>{
     if(statusRef.current==="scanning"||statusRef.current==="thinking") return;
     setStatus("scanning");
+    setAiStatus(getRandMsg("scanning"));
     sl("","blank"); sl("▶ New scan cycle","header");
 
     const raw=await fetchMarkets(100);
@@ -773,6 +973,8 @@ export default function App(){
       return true;
     });
     if(newDead>0){setBlacklist(new Set(bl));blackRef.current=new Set(bl);setStats(s=>({...s,blacklisted:bl.size}));sl(`Blacklisted ${newDead} new dead markets (total:${bl.size})`,"warn");}
+
+    setAiStatus(getRandMsg("filtering"));
 
     // score & sort — prefer mid-range, high volume, tight spread
     const scored=alive.filter(m=>(m.volume24h||0)>=200).map(m=>{
@@ -804,6 +1006,7 @@ export default function App(){
       const tag=m.yesPrice>=0.30&&m.yesPrice<=0.70?"MID":m.yesPrice>=0.15&&m.yesPrice<=0.85?"SIDE":"EDGE";
       sl(`[${i+1}/8] [${tag}] ${m.question.slice(0,60)}`,"mkt");
       sl(`  YES:${pct(m.yesPrice)}  Vol:${mini(m.volume24h)}  Δ24h:${((m.oneDayChange||0)*100).toFixed(1)}%`,"dim");
+      setAiStatus(getRandMsg("analyzing_start"));
 
       // live price
       const live=await getLivePrice(m.yesId,m.conditionId);
@@ -820,21 +1023,36 @@ export default function App(){
         sl("","blank");continue;
       }
 
-      // hard block: extreme order book
-      if(m.bestAsk&&m.bestAsk>0.92){sl(`  Order book ask ${pct(m.bestAsk)} too high — blacklisting`,"warn");bl.add(m.id);setBlacklist(new Set(bl));blackRef.current=new Set(bl);sl("","blank");continue;}
-      if(m.bestBid&&m.bestBid<0.04){sl(`  Order book bid ${pct(m.bestBid)} too low — blacklisting`,"warn");bl.add(m.id);setBlacklist(new Set(bl));blackRef.current=new Set(bl);sl("","blank");continue;}
+      // Only skip on extreme OB if price came from a REAL order book (not Gamma fallback)
+      // When Gamma is source, bestBid/bestAsk will be null so this block won't trigger
+      if (live?.source === "orderbook" && m.bestAsk && m.bestAsk > 0.92) {
+        sl(`  Real OB ask ${pct(m.bestAsk)} too high — smart skip`, "warn");
+        sl("", "blank"); continue;
+      }
+      if (live?.source === "orderbook" && m.bestBid && m.bestBid < 0.04) {
+        sl(`  Real OB bid ${pct(m.bestBid)} too low — smart skip`, "warn");
+        sl("", "blank"); continue;
+      }
 
       // news
+      setAiStatus(getRandMsg("news_searching"));
       const nr=await fetchNews(m.question);
       setStats(s=>({...s,newsTotal:s.newsTotal+nr.articles.length}));
       if(nr.articles.length>0){
         sl(`  [${nr.api}] ${nr.articles.length} arts — "${nr.query.slice(0,40)}"`,"ok");
         nr.articles.slice(0,2).forEach(a=>sl(`    • [${ageStr(a.published)}] ${a.title.slice(0,62)}`,"newsitem"));
-      } else sl(`  No news — statistical model only`,"dim");
+        setAiStatus(getRandMsg("news_found",{n:nr.articles.length}));
+      } else {
+        sl(`  No news — statistical model only`,"dim");
+        setAiStatus(getRandMsg("news_none"));
+      }
 
       // AI analysis
+      setAiStatus(getRandMsg("thinking"));
       al("","blank");
-      const result=analyzeMarket(m,nr.articles,portRef.current.cash);
+      const result=analyzeMarket(m,nr.articles,portRef.current.cash,perfStats);
+      // Show "interesting" message if confidence is close to threshold
+      if(result.conf >= CONF_THRESH - 5 && result.conf < CONF_THRESH) setAiStatus(getRandMsg("interesting"));
       result.log.forEach(line=>{
         const t=line.startsWith("[DECISION]")?"decision":line.startsWith("[CONFIDENCE]")?"conf":line.startsWith("[SENTIMENT]")||line.startsWith("[BLOCKED]")?"sent":line.startsWith("[SIGNALS]")?"warn":line.startsWith("[STAT")||line.startsWith("[NEWS")?"price":line.startsWith("[CONFLICT]")?"err":line.startsWith("[MOMENTUM]")||line.startsWith("[TIME]")?"dim":line.startsWith("[")?"mkt":line.startsWith("─")?"div":"dim";
         al(line,t);
@@ -844,6 +1062,7 @@ export default function App(){
       const go=(result.action==="BUY_YES"||result.action==="BUY_NO")&&result.conf>=CONF_THRESH&&result.amount>0&&portRef.current.cash>=result.amount;
 
       if(go){
+        setAiStatus(getRandMsg("trade_found"));
         const side=result.action==="BUY_YES"?"YES":"NO";
         const ep=side==="YES"?(m.bestAsk&&m.bestAsk<0.90?m.bestAsk:m.yesPrice):(m.bestBid&&m.bestBid>0.10?(1-m.bestBid):m.noPrice);
         const shares=result.amount/ep;
@@ -872,6 +1091,8 @@ export default function App(){
         await sleep(200);
       } else {
         setStats(s=>({...s,skipped:s.skipped+1}));
+        const skipMsg = result.signals?.isConflict ? getRandMsg("skip_conflict") : getRandMsg("skip_low_conf");
+        setAiStatus(skipMsg);
         if(result.conf<38&&!nr.articles.length&&Math.abs(m.oneDayChange||0)<0.003){bl.add(m.id);setBlacklist(new Set(bl));blackRef.current=new Set(bl);}
       }
       sl("","blank"); await sleep(80);
@@ -881,7 +1102,8 @@ export default function App(){
     sl("✓ Scan complete.","ok");
     sys(`[SCAN] done. Cash:${dollar(portRef.current.cash)} Open:${portRef.current.positions.filter(p=>p.status==="OPEN").length}`,"ok");
     setStatus("idle");
-  },[sl,al,sys,refreshPrices]);
+    setAiStatus(auto ? getRandMsg("idle_waiting") : "Scan complete. Click SCAN to run again.");
+  },[sl,al,sys,refreshPrices,auto]);
 
   // ── eval sells ──
   const evalSells=useCallback(async()=>{
@@ -963,42 +1185,70 @@ export default function App(){
       {/* TITLE */}
       <div style={{flexShrink:0,height:"30px",background:"#111",borderBottom:"1px solid #1e1e1e",display:"flex",alignItems:"center",padding:"0 14px",gap:"12px"}}>
         <span style={{color:"#ddd",fontWeight:"bold",letterSpacing:"3px",fontSize:"13px"}}>POLYBOT</span>
-        <span style={{color:"#222"}}>│</span>
+        <span style={{color:"#555"}}>│</span>
         <span style={{color:"#444",fontSize:"11px"}}>v{VERSION}</span>
-        <span style={{color:"#222"}}>│</span>
-        <span style={{color:"#333",fontSize:"11px"}}>Multi-Signal AI  •  Order Book Pricing  •  Performance Tracking</span>
+        <span style={{color:"#555"}}>│</span>
+        {/* API health indicators */}
+        {diag && (
+          <div style={{display:"flex",gap:"6px",alignItems:"center",fontSize:"9px"}}>
+            <span style={{color:diag.gamma?"#3a6a3a":"#6a3a3a",padding:"1px 5px",background:diag.gamma?"#0a180a":"#180a0a"}}>Gamma:{diag.gamma?"✓":"✗"}</span>
+            <span style={{color:diag.clob?"#3a6a3a":"#5a5a3a",padding:"1px 5px",background:diag.clob?"#0a180a":"#141408"}}>CLOB:{diag.clob?"✓":"~"}</span>
+            <span style={{color:diag.news?"#3a6a3a":"#5a5a3a",padding:"1px 5px",background:diag.news?"#0a180a":"#141408"}}>News:{diag.news?"✓":"~"}</span>
+            <span style={{color:"#666"}}>{diag.ping}ms</span>
+          </div>
+        )}
         <div style={{marginLeft:"auto",display:"flex",gap:"16px",fontSize:"11px",alignItems:"center"}}>
           {open.length>0&&<span style={{color:"#2a4a2a",fontSize:"10px"}}>↻10s</span>}
           <span style={{color:stCol[status]}}>● {stLbl[status]}{auto?" [AUTO]":""}</span>
-          <span style={{color:"#252525",fontSize:"10px"}}>{fmtUp(stats.uptime)}</span>
+          <span style={{color:"#555",fontSize:"10px"}}>{fmtUp(stats.uptime)}</span>
         </div>
+      </div>
+
+      {/* AI STATUS BAR */}
+      <div style={{flexShrink:0,height:"24px",background:"#0c0c0c",borderBottom:"1px solid #181818",display:"flex",alignItems:"center",padding:"0 14px",gap:"10px",overflow:"hidden"}}>
+        <span style={{color:"#1a3a1a",fontSize:"9px",letterSpacing:"0.5px",flexShrink:0}}>AI</span>
+        <span style={{color:"#555",flexShrink:0}}>│</span>
+        {/* Animated thinking dots when active */}
+        {(status==="thinking"||status==="scanning") && (
+          <span style={{color:"#2a4a2a",fontSize:"9px",flexShrink:0,fontFamily:"monospace"}}>
+            {["◐","◓","◑","◒"][Math.floor(Date.now()/250)%4]}
+          </span>
+        )}
+        <span style={{
+          color: status==="trading"?"#5a9a5a": status==="thinking"?"#7a7a5a": status==="scanning"?"#555":"#333",
+          fontSize:"11px", fontFamily:"Consolas,monospace", flex:1,
+          overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap",
+        }}>{aiStatus}</span>
+        {status==="idle" && auto && (
+          <span style={{color:"#1e2e1e",fontSize:"9px",flexShrink:0}}>next scan in ~3min</span>
+        )}
       </div>
 
       {/* STATS STRIP */}
       <div style={{flexShrink:0,height:"28px",background:"#0a0a0a",borderBottom:"1px solid #181818",display:"flex",alignItems:"center",overflowX:"auto",overflowY:"hidden"}}>
         {[
-          ["CASH",       dollar(portfolio.cash),                            portfolio.cash>=START_CASH?"#bbb":"#666"],
-          ["PORTFOLIO",  dollar(totalVal),                                  totalVal>=START_CASH?"#ccc":"#666"],
-          ["P&L",        (totalPnl>=0?"+":"")+dollar(totalPnl),            totalPnl>=0?"#ddd":"#777"],
-          ["RETURN",     (ret>=0?"+":"")+ret.toFixed(2)+"%",               ret>=0?"#ccc":"#666"],
-          ["UNREALIZED", (unrealPnl>=0?"+":"")+dollar(unrealPnl),         unrealPnl>=0?"#bbb":"#666"],
-          ["REALIZED",   (realPnl>=0?"+":"")+dollar(realPnl),              realPnl>=0?"#bbb":"#666"],
-          ["WIN RATE",   winRate,                                           "#888"],
-          ["W/L",        `${wins}/${losses}`,                              "#777"],
-          ["AVG WIN",    wins>0?dollar(avgWin):"--",                       "#5a9a5a"],
-          ["AVG LOSS",   losses>0?dollar(avgLoss):"--",                    "#9a5a5a"],
-          ["PROF.FACT",  pf>0?pf.toFixed(2)+"x":"--",                     pf>=1.5?"#5a9a5a":pf>=1?"#9a9a5a":"#666"],
-          ["INVESTED",   dollar(invested),                                  "#888"],
-          ["OPEN",       open.length+" / "+MAX_OPEN,                       open.length>=MAX_OPEN?"#9a5a5a":"#777"],
-          ["TRADES",     portfolio.trades.length,                           "#666"],
-          ["SCANS",      stats.scans,                                       "#555"],
-          ["AVG CONF",   stats.avgConf?stats.avgConf+"%":"--",             "#666"],
-          ["BLACKLIST",  blacklist.size,                                    "#555"],
-          ["THRESHOLD",  CONF_THRESH+"%",                                  "#5a5a9a"],
+          ["CASH",       dollar(portfolio.cash),                            portfolio.cash>=START_CASH?"#e0e0e0":"#888"],
+          ["PORTFOLIO",  dollar(totalVal),                                  totalVal>=START_CASH?"#e8e8e8":"#888"],
+          ["P&L",        (totalPnl>=0?"+":"")+dollar(totalPnl),            totalPnl>=0?"#fff":"#cc8888"],
+          ["RETURN",     (ret>=0?"+":"")+ret.toFixed(2)+"%",               ret>=0?"#e0e0e0":"#cc8888"],
+          ["UNREALIZED", (unrealPnl>=0?"+":"")+dollar(unrealPnl),         unrealPnl>=0?"#d0d0d0":"#cc8888"],
+          ["REALIZED",   (realPnl>=0?"+":"")+dollar(realPnl),              realPnl>=0?"#d0d0d0":"#cc8888"],
+          ["WIN RATE",   winRate,                                           "#bbbbbb"],
+          ["W/L",        `${wins}/${losses}`,                              "#aaaaaa"],
+          ["AVG WIN",    wins>0?dollar(avgWin):"--",                       "#7acc7a"],
+          ["AVG LOSS",   losses>0?dollar(avgLoss):"--",                    "#cc7a7a"],
+          ["PROF.FACT",  pf>0?pf.toFixed(2)+"x":"--",                     pf>=1.5?"#7acc7a":pf>=1?"#cccc7a":"#aaaaaa"],
+          ["INVESTED",   dollar(invested),                                  "#bbbbbb"],
+          ["OPEN",       open.length+" / "+MAX_OPEN,                       open.length>=MAX_OPEN?"#cc7a7a":"#aaaaaa"],
+          ["TRADES",     portfolio.trades.length,                           "#aaaaaa"],
+          ["SCANS",      stats.scans,                                       "#999999"],
+          ["AVG CONF",   stats.avgConf?stats.avgConf+"%":"--",             "#aaaaaa"],
+          ["BLACKLIST",  blacklist.size,                                    "#999999"],
+          ["THRESHOLD",  CONF_THRESH+"%",                                  "#8888cc"],
         ].map(([label,val,color])=>(
-          <div key={label} style={{display:"flex",flexDirection:"column",padding:"2px 10px",borderRight:"1px solid #141414",flexShrink:0}}>
-            <span style={{color:"#202020",fontSize:"8px",letterSpacing:"0.3px"}}>{label}</span>
-            <span style={{color:color||"#888",fontSize:"11px"}}>{val}</span>
+          <div key={label} style={{display:"flex",flexDirection:"column",padding:"2px 10px",borderRight:"1px solid #1e1e1e",flexShrink:0}}>
+            <span style={{color:"#666",fontSize:"8px",letterSpacing:"0.5px"}}>{label}</span>
+            <span style={{color:color||"#aaa",fontSize:"11px",fontWeight:"bold"}}>{val}</span>
           </div>
         ))}
       </div>
@@ -1019,7 +1269,7 @@ export default function App(){
               ]}>
               <LogPanel logs={scanLog} logRef={scanLogRef}/>
             </Panel>
-            <Panel title="AI ENGINE" badge={`thresh:${CONF_THRESH}%  fixed-math`} style={{flex:1}}>
+            <Panel title="AI ENGINE" badge={`thresh:${CONF_THRESH}%  adaptive-RL`} style={{flex:1}}>
               <LogPanel logs={aiLog} logRef={aiLogRef}/>
             </Panel>
             <Panel title="SELL MONITOR" style={{flex:1}}
@@ -1034,7 +1284,7 @@ export default function App(){
               {TABS.map(t=>(
                 <button key={t.id} onClick={()=>setTab(t.id)} style={{background:tab===t.id?"#141414":"transparent",border:"none",borderBottom:tab===t.id?"2px solid #555":"2px solid transparent",color:tab===t.id?"#ccc":"#333",padding:"5px 14px",fontSize:"11px",fontFamily:"Consolas,monospace",cursor:"pointer"}}>{t.label}</button>
               ))}
-              <div style={{marginLeft:"auto",display:"flex",gap:"14px",fontSize:"10px",color:"#222",paddingRight:"10px"}}>
+              <div style={{marginLeft:"auto",display:"flex",gap:"14px",fontSize:"10px",color:"#555",paddingRight:"10px"}}>
                 <span>Refresh:{refreshTs}({refreshN})</span>
                 <span>Best:{stats.best?dollar(stats.best.pnl):"--"}</span>
                 <span>Worst:{stats.worst?dollar(stats.worst.pnl):"--"}</span>
@@ -1045,7 +1295,7 @@ export default function App(){
 
               {/* POSITIONS */}
               {tab==="positions"&&(open.length===0
-                ?<div style={{color:"#1e1e1e",padding:"40px",textAlign:"center",fontSize:"13px"}}>No open positions — click SCAN to start.</div>
+                ?<div style={{color:"#666",padding:"40px",textAlign:"center",fontSize:"13px"}}>No open positions — click SCAN to start.</div>
                 :<>
                   <div style={{marginBottom:"6px",padding:"4px 10px",background:"#0a140a",border:"1px solid #1a2a1a",fontSize:"10px",color:"#3a5a3a",display:"flex",gap:"16px",alignItems:"center"}}>
                     <span>● LIVE — order book prices, auto-refresh 10s, close +50%/-45%</span>
@@ -1078,8 +1328,8 @@ export default function App(){
                             <td style={{padding:"4px 8px",color:"#444"}}>{dollar(pos.maxProfit)}</td>
                             <td style={{padding:"4px 8px"}}><ConfBar conf={pos.conf}/></td>
                             <td style={{padding:"4px 8px",color:days<3?"#8a5a5a":"#333",fontSize:"9px"}}>{days<1?`${(days*24).toFixed(0)}h`:Math.round(days)+"d"}</td>
-                            <td style={{padding:"4px 8px",color:"#252525",fontSize:"9px"}}>{pos.priceSource}</td>
-                            <td style={{padding:"4px 8px",color:"#222",fontSize:"9px"}}>{pos.lastUpdate}</td>
+                            <td style={{padding:"4px 8px",color:"#555",fontSize:"9px"}}>{pos.priceSource}</td>
+                            <td style={{padding:"4px 8px",color:"#555",fontSize:"9px"}}>{pos.lastUpdate}</td>
                           </tr>
                         );
                       })}
@@ -1096,13 +1346,13 @@ export default function App(){
                     </tfoot>
                   </table>
                   <div style={{marginTop:"8px"}}>
-                    <div style={{color:"#1e1e1e",fontSize:"10px",marginBottom:"4px",padding:"2px"}}>AI REASONING PER POSITION</div>
+                    <div style={{color:"#666",fontSize:"10px",marginBottom:"4px",padding:"2px"}}>AI REASONING PER POSITION</div>
                     {open.map((pos,i)=>(
                       <div key={pos.id} style={{display:"flex",gap:"8px",padding:"3px 0",borderBottom:"1px solid #0f0f0f",fontSize:"10px"}}>
-                        <span style={{color:"#2a2a2a",flexShrink:0,width:"14px"}}>{i+1}.</span>
+                        <span style={{color:"#666",flexShrink:0,width:"14px"}}>{i+1}.</span>
                         <TypeBadge type={pos.mktType}/>
                         <ConfBar conf={pos.conf} width={40}/>
-                        <span style={{color:"#2e2e2e",marginLeft:"4px",flex:1}}>{pos.reason}</span>
+                        <span style={{color:"#666",marginLeft:"4px",flex:1}}>{pos.reason}</span>
                       </div>
                     ))}
                   </div>
@@ -1132,15 +1382,15 @@ export default function App(){
                       {l:"Worst Trade",       v:stats.worst?dollar(stats.worst.pnl):"--",    s:stats.worst?.question?.slice(0,22),hi:false},
                     ].map(c=>(
                       <div key={c.l} style={{background:"#0d0d0d",border:"1px solid #181818",padding:"10px 14px"}}>
-                        <div style={{color:"#1e1e1e",fontSize:"9px",marginBottom:"5px"}}>{c.l}</div>
+                        <div style={{color:"#666",fontSize:"9px",marginBottom:"5px"}}>{c.l}</div>
                         <div style={{color:c.hi===true?"#ddd":c.hi===false?"#666":"#aaa",fontSize:"18px"}}>{c.v}</div>
-                        <div style={{color:"#181818",fontSize:"9px",marginTop:"3px"}}>{c.s}</div>
+                        <div style={{color:"#555",fontSize:"9px",marginTop:"3px"}}>{c.s}</div>
                       </div>
                     ))}
                   </div>
                   {stats.confHistory.length>2&&(
                     <div style={{marginBottom:"10px",padding:"8px",background:"#0d0d0d",border:"1px solid #181818"}}>
-                      <div style={{color:"#222",fontSize:"10px",marginBottom:"6px"}}>CONFIDENCE HISTORY — last {stats.confHistory.length} trades</div>
+                      <div style={{color:"#555",fontSize:"10px",marginBottom:"6px"}}>CONFIDENCE HISTORY — last {stats.confHistory.length} trades</div>
                       <div style={{display:"flex",alignItems:"center",gap:"12px"}}>
                         <MiniSpark data={stats.confHistory} w={180} h={32} color="#4a7a4a"/>
                         <div style={{fontSize:"10px",color:"#333"}}>
@@ -1152,7 +1402,7 @@ export default function App(){
                   )}
                   {portfolio.closed.length>0&&(
                     <>
-                      <div style={{color:"#222",fontSize:"10px",marginBottom:"6px"}}>CLOSED TRADES</div>
+                      <div style={{color:"#555",fontSize:"10px",marginBottom:"6px"}}>CLOSED TRADES</div>
                       <table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
                         <TH cols={["#","Market","Side","Entry","Close","Cost","Proceeds","P&L","P&L%","Reason","Conf","Closed"]}/>
                         <tbody>
@@ -1169,7 +1419,7 @@ export default function App(){
                               <td style={{padding:"4px 8px",color:t.pnl>=0?"#888":"#555"}}>{((t.pnlPct||0)*100).toFixed(1)}%</td>
                               <td style={{padding:"4px 8px",color:"#333",fontSize:"9px"}}>{t.closeReason||"manual"}</td>
                               <td style={{padding:"4px 8px"}}><ConfBar conf={t.conf} width={36}/></td>
-                              <td style={{padding:"4px 8px",color:"#252525"}}>{t.closedAt}</td>
+                              <td style={{padding:"4px 8px",color:"#555"}}>{t.closedAt}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -1181,7 +1431,7 @@ export default function App(){
 
               {/* HISTORY */}
               {tab==="trades"&&(portfolio.trades.length===0
-                ?<div style={{color:"#1e1e1e",padding:"40px",textAlign:"center"}}>No trades yet.</div>
+                ?<div style={{color:"#666",padding:"40px",textAlign:"center"}}>No trades yet.</div>
                 :<table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
                   <TH cols={["#","Time","Type","Market","Side","Entry","Amt","Shares","Spread","Qual","Days","Conf","Sigs","Status","P&L","Edge","Source"]}/>
                   <tbody>
@@ -1192,7 +1442,7 @@ export default function App(){
                       return(
                         <tr key={t.id} style={{borderBottom:"1px solid #0f0f0f",background:cl?(cl.pnl>0?"#0a130a":"#130a0a"):"transparent"}}>
                           <td style={{padding:"4px 8px",color:"#333"}}>{portfolio.trades.length-i}</td>
-                          <td style={{padding:"4px 8px",color:"#2a2a2a",whiteSpace:"nowrap"}}>{t.openedAt}</td>
+                          <td style={{padding:"4px 8px",color:"#666",whiteSpace:"nowrap"}}>{t.openedAt}</td>
                           <td style={{padding:"4px 8px"}}><TypeBadge type={t.mktType}/></td>
                           <td style={{padding:"4px 8px",color:"#555",maxWidth:"170px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.question}</td>
                           <td style={{padding:"4px 8px",color:t.side==="YES"?"#aaa":"#777",fontWeight:"bold"}}>{t.side}</td>
@@ -1209,7 +1459,7 @@ export default function App(){
                           </td>
                           <td style={{padding:"4px 8px",color:pnl>=0?"#bbb":"#666",fontWeight:"bold"}}>{(pnl>=0?"+":"-")+dollar(pnl)}</td>
                           <td style={{padding:"4px 8px",color:"#3a5a3a",fontSize:"9px"}}>{t.edgeFrom}</td>
-                          <td style={{padding:"4px 8px",color:"#252525",fontSize:"9px"}}>{t.priceSource}</td>
+                          <td style={{padding:"4px 8px",color:"#555",fontSize:"9px"}}>{t.priceSource}</td>
                         </tr>
                       );
                     })}
@@ -1219,7 +1469,7 @@ export default function App(){
 
               {/* MARKETS */}
               {tab==="markets"&&(markets.length===0
-                ?<div style={{color:"#1e1e1e",padding:"40px",textAlign:"center"}}>Run scan to load markets.</div>
+                ?<div style={{color:"#666",padding:"40px",textAlign:"center"}}>Run scan to load markets.</div>
                 :<table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
                   <TH cols={["#","BL","Type","Market","YES%","NO%","Bid","Ask","Spread","Vol24h","Liq","Qual","Comp","24hΔ","7dΔ","Ends"]}/>
                   <tbody>
@@ -1244,8 +1494,8 @@ export default function App(){
                           <td style={{padding:"4px 8px",color:qual>=65?"#4a7a4a":qual>=45?"#666":"#6a4a4a"}}>{qual}</td>
                           <td style={{padding:"4px 8px",color:"#3a3a3a",fontSize:"9px"}}>{((m.competitive||0)*100).toFixed(0)}%</td>
                           <td style={{padding:"4px 8px",color:m.oneDayChange>0?"#aaa":m.oneDayChange<0?"#666":"#333"}}>{m.oneDayChange>0?"▲":m.oneDayChange<0?"▼":"─"}{(Math.abs(m.oneDayChange||0)*100).toFixed(1)}%</td>
-                          <td style={{padding:"4px 8px",color:"#2e2e2e"}}>{m.oneWeekChange>0?"+":""}{((m.oneWeekChange||0)*100).toFixed(1)}%</td>
-                          <td style={{padding:"4px 8px",color:"#1e1e1e",whiteSpace:"nowrap"}}>{m.endDate?new Date(m.endDate).toLocaleDateString():"--"}</td>
+                          <td style={{padding:"4px 8px",color:"#666"}}>{m.oneWeekChange>0?"+":""}{((m.oneWeekChange||0)*100).toFixed(1)}%</td>
+                          <td style={{padding:"4px 8px",color:"#666",whiteSpace:"nowrap"}}>{m.endDate?new Date(m.endDate).toLocaleDateString():"--"}</td>
                         </tr>
                       );
                     })}
@@ -1270,7 +1520,7 @@ export default function App(){
                     </div>
                     <div style={{flex:1,overflowY:"auto"}}>
                       {leaders.length===0
-                        ?<div style={{color:"#1e1e1e",padding:"40px",textAlign:"center"}}>Click LOAD to fetch top traders.</div>
+                        ?<div style={{color:"#666",padding:"40px",textAlign:"center"}}>Click LOAD to fetch top traders.</div>
                         :<table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
                           <TH cols={["#","Trader","P&L","Volume","Verified","VIEW"]}/>
                           <tbody>
@@ -1280,7 +1530,7 @@ export default function App(){
                                 <td style={{padding:"5px 8px"}}>
                                   <div style={{color:i<3?"#ddd":"#777"}}>{tr.userName||`${(tr.proxyWallet||"").slice(0,10)}...`}</div>
                                   {tr.xUsername&&<div style={{color:"#333",fontSize:"9px"}}>@{tr.xUsername}</div>}
-                                  <div style={{color:"#1e1e1e",fontSize:"9px"}}>{(tr.proxyWallet||"").slice(0,14)}...</div>
+                                  <div style={{color:"#666",fontSize:"9px"}}>{(tr.proxyWallet||"").slice(0,14)}...</div>
                                 </td>
                                 <td style={{padding:"5px 8px",color:(tr.pnl||0)>=0?"#bbb":"#666",fontWeight:"bold"}}>{(tr.pnl||0)>=0?"+":"-"}{dollar(tr.pnl||0)}</td>
                                 <td style={{padding:"5px 8px",color:"#555"}}>{mini(tr.vol||0)}</td>
@@ -1295,31 +1545,31 @@ export default function App(){
                   </div>
                   <div style={{width:"320px",flexShrink:0,display:"flex",flexDirection:"column",overflow:"hidden"}}>
                     {!wallet
-                      ?<div style={{color:"#1e1e1e",padding:"20px",fontSize:"11px"}}>Click VIEW on any trader to inspect their open positions and trade history.</div>
+                      ?<div style={{color:"#666",padding:"20px",fontSize:"11px"}}>Click VIEW on any trader to inspect their open positions and trade history.</div>
                       :<>
                         <div style={{flexShrink:0,padding:"8px 10px",borderBottom:"1px solid #1a1a1a",background:"#0d0d0d"}}>
                           <div style={{color:"#bbb",fontSize:"11px",fontWeight:"bold"}}>{wallet.name||"Wallet"}</div>
-                          <div style={{color:"#2a2a2a",fontSize:"9px",marginTop:"1px"}}>{wallet.addr}</div>
+                          <div style={{color:"#666",fontSize:"9px",marginTop:"1px"}}>{wallet.addr}</div>
                           {wallet.value!=null&&<div style={{color:"#5a9a5a",fontSize:"10px",marginTop:"2px"}}>Portfolio: {dollar(wallet.value)}</div>}
                         </div>
                         <div style={{flex:1,overflowY:"auto"}}>
                           {wLoading
-                            ?<div style={{color:"#222",padding:"16px"}}>Loading...</div>
+                            ?<div style={{color:"#555",padding:"16px"}}>Loading...</div>
                             :<>
-                              <div style={{padding:"5px 10px",color:"#2e2e2e",fontSize:"10px",borderBottom:"1px solid #141414"}}>OPEN ({(wallet.positions||[]).length})</div>
+                              <div style={{padding:"5px 10px",color:"#666",fontSize:"10px",borderBottom:"1px solid #141414"}}>OPEN ({(wallet.positions||[]).length})</div>
                               {(wallet.positions||[]).slice(0,12).map((pos,i)=>(
                                 <div key={i} style={{padding:"5px 10px",borderBottom:"1px solid #0f0f0f"}}>
                                   <div style={{color:"#444",fontSize:"10px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{pos.title||pos.market||pos.marketSlug||"Unknown"}</div>
                                   <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",marginTop:"1px"}}>
                                     <span style={{color:(pos.outcome||pos.outcomeLabel)==="YES"?"#4a8a4a":"#8a4a4a"}}>{pos.outcome||pos.outcomeLabel||"?"}</span>
                                     <span style={{color:"#333"}}>{pos.size?`${(+pos.size).toFixed(2)}shr`:""}</span>
-                                    <span style={{color:"#2a2a2a"}}>{pos.avgPrice?pct(+pos.avgPrice):"--"}</span>
+                                    <span style={{color:"#666"}}>{pos.avgPrice?pct(+pos.avgPrice):"--"}</span>
                                     <span style={{color:(pos.cashPnl||0)>=0?"#bbb":"#666",fontWeight:"bold"}}>{pos.cashPnl!=null?(pos.cashPnl>=0?"+":"-")+dollar(pos.cashPnl):"--"}</span>
                                   </div>
                                 </div>
                               ))}
-                              {(wallet.positions||[]).length===0&&<div style={{color:"#222",padding:"10px"}}>No open positions.</div>}
-                              <div style={{padding:"5px 10px",color:"#2e2e2e",fontSize:"10px",borderBottom:"1px solid #141414",borderTop:"1px solid #141414"}}>RECENT TRADES ({(wallet.trades||[]).length})</div>
+                              {(wallet.positions||[]).length===0&&<div style={{color:"#555",padding:"10px"}}>No open positions.</div>}
+                              <div style={{padding:"5px 10px",color:"#666",fontSize:"10px",borderBottom:"1px solid #141414",borderTop:"1px solid #141414"}}>RECENT TRADES ({(wallet.trades||[]).length})</div>
                               {(wallet.trades||[]).slice(0,12).map((tr,i)=>(
                                 <div key={i} style={{padding:"4px 10px",borderBottom:"1px solid #0f0f0f"}}>
                                   <div style={{color:"#333",fontSize:"10px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tr.title||tr.market||tr.marketSlug||"Unknown"}</div>
@@ -1327,11 +1577,11 @@ export default function App(){
                                     <span style={{color:tr.side==="BUY"?"#4a8a4a":"#8a4a4a"}}>{tr.side||"?"}</span>
                                     <span style={{color:"#333"}}>{tr.outcomeIndex===0?"YES":tr.outcomeIndex===1?"NO":tr.outcome||"?"}</span>
                                     <span style={{color:"#333"}}>{tr.size?dollar(+tr.size):tr.usdcSize?dollar(+tr.usdcSize):""}</span>
-                                    <span style={{color:"#222"}}>{ageStr(tr.timestamp||tr.createdAt)}</span>
+                                    <span style={{color:"#555"}}>{ageStr(tr.timestamp||tr.createdAt)}</span>
                                   </div>
                                 </div>
                               ))}
-                              {(wallet.trades||[]).length===0&&<div style={{color:"#222",padding:"10px"}}>No recent trades.</div>}
+                              {(wallet.trades||[]).length===0&&<div style={{color:"#555",padding:"10px"}}>No recent trades.</div>}
                             </>
                           }
                         </div>
@@ -1344,11 +1594,11 @@ export default function App(){
               {/* PERFORMANCE ANALYTICS */}
               {tab==="perf"&&(
                 <div>
-                  <div style={{color:"#2a2a2a",fontSize:"11px",marginBottom:"12px",padding:"6px",background:"#0d0d0d",border:"1px solid #181818"}}>
+                  <div style={{color:"#666",fontSize:"11px",marginBottom:"12px",padding:"6px",background:"#0d0d0d",border:"1px solid #181818"}}>
                     Performance analytics track outcomes to help identify what's working. Updated after each closed trade.
                   </div>
                   {!perfStats
-                    ?<div style={{color:"#1e1e1e",padding:"40px",textAlign:"center"}}>No closed trades yet — performance data will appear here after positions are closed.</div>
+                    ?<div style={{color:"#666",padding:"40px",textAlign:"center"}}>No closed trades yet — performance data will appear here after positions are closed.</div>
                     :<>
                       <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"8px",marginBottom:"12px"}}>
                         {[
@@ -1357,14 +1607,14 @@ export default function App(){
                           {l:"Profit Factor",   v:pf>0?pf.toFixed(2)+"x":"--",         c:pf>=1.2?"#5a9a5a":"#9a5a5a"},
                         ].map(c=>(
                           <div key={c.l} style={{background:"#0d0d0d",border:"1px solid #181818",padding:"10px 14px"}}>
-                            <div style={{color:"#1e1e1e",fontSize:"9px",marginBottom:"4px"}}>{c.l}</div>
+                            <div style={{color:"#666",fontSize:"9px",marginBottom:"4px"}}>{c.l}</div>
                             <div style={{color:c.c,fontSize:"20px"}}>{c.v}</div>
                           </div>
                         ))}
                       </div>
                       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
                         <div style={{background:"#0d0d0d",border:"1px solid #181818",padding:"10px"}}>
-                          <div style={{color:"#2e2e2e",fontSize:"10px",marginBottom:"8px"}}>PERFORMANCE BY MARKET TYPE</div>
+                          <div style={{color:"#666",fontSize:"10px",marginBottom:"8px"}}>PERFORMANCE BY MARKET TYPE</div>
                           <table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
                             <TH cols={["Type","Trades","Win%","P&L"]}/>
                             <tbody>
@@ -1380,7 +1630,7 @@ export default function App(){
                           </table>
                         </div>
                         <div style={{background:"#0d0d0d",border:"1px solid #181818",padding:"10px"}}>
-                          <div style={{color:"#2e2e2e",fontSize:"10px",marginBottom:"8px"}}>PERFORMANCE BY EDGE SOURCE</div>
+                          <div style={{color:"#666",fontSize:"10px",marginBottom:"8px"}}>PERFORMANCE BY EDGE SOURCE</div>
                           <table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
                             <TH cols={["Edge","Trades","Win%","P&L"]}/>
                             <tbody>
@@ -1398,7 +1648,7 @@ export default function App(){
                       </div>
                       {stats.confHistory.length>1&&(
                         <div style={{marginTop:"12px",background:"#0d0d0d",border:"1px solid #181818",padding:"10px"}}>
-                          <div style={{color:"#2e2e2e",fontSize:"10px",marginBottom:"8px"}}>CONFIDENCE DISTRIBUTION</div>
+                          <div style={{color:"#666",fontSize:"10px",marginBottom:"8px"}}>CONFIDENCE DISTRIBUTION</div>
                           <div style={{display:"flex",alignItems:"flex-end",gap:"3px",height:"50px"}}>
                             {[50,55,60,65,70,75,80,85,90].map(bucket=>{
                               const count=stats.confHistory.filter(c=>c>=bucket&&c<bucket+5).length;
@@ -1407,7 +1657,7 @@ export default function App(){
                               return(
                                 <div key={bucket} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:"2px"}}>
                                   <div style={{height:h+"px",background:"#3a5a3a",width:"100%",minWidth:"20px"}}/>
-                                  <span style={{color:"#252525",fontSize:"8px"}}>{bucket}</span>
+                                  <span style={{color:"#555",fontSize:"8px"}}>{bucket}</span>
                                   {count>0&&<span style={{color:"#333",fontSize:"8px"}}>{count}</span>}
                                 </div>
                               );
@@ -1428,7 +1678,7 @@ export default function App(){
                     {blacklist.size>0&&<button onClick={()=>{setBlacklist(new Set());blackRef.current=new Set();sys("[BL] Cleared","warn");}} style={{background:"transparent",border:"1px solid #2a2a2a",color:"#444",padding:"2px 10px",fontSize:"10px",fontFamily:"Consolas,monospace",cursor:"pointer"}}>CLEAR ALL</button>}
                   </div>
                   {blacklist.size===0
-                    ?<div style={{color:"#1e1e1e",padding:"40px",textAlign:"center"}}>No blacklisted markets.</div>
+                    ?<div style={{color:"#666",padding:"40px",textAlign:"center"}}>No blacklisted markets.</div>
                     :<table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
                       <TH cols={["#","Market","Price","Quality","Reason"]}/>
                       <tbody>
@@ -1437,11 +1687,11 @@ export default function App(){
                           const q=m?calcQuality(m):null;
                           return(
                             <tr key={id} style={{borderBottom:"1px solid #0f0f0f"}}>
-                              <td style={{padding:"4px 8px",color:"#222"}}>{i+1}</td>
-                              <td style={{padding:"4px 8px",color:"#2e2e2e",maxWidth:"360px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m?.question||id}</td>
+                              <td style={{padding:"4px 8px",color:"#555"}}>{i+1}</td>
+                              <td style={{padding:"4px 8px",color:"#666",maxWidth:"360px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m?.question||id}</td>
                               <td style={{padding:"4px 8px",color:"#333"}}>{m?pct(m.yesPrice):"--"}</td>
                               <td style={{padding:"4px 8px",color:q>=50?"#4a7a4a":"#6a4a4a"}}>{q??""}</td>
-                              <td style={{padding:"4px 8px",color:"#222"}}>{m?(m.yesPrice>PRICE_MAX||m.yesPrice<PRICE_MIN)?"Price out of range":"Low activity/dead":"Unknown"}</td>
+                              <td style={{padding:"4px 8px",color:"#555"}}>{m?(m.yesPrice>PRICE_MAX||m.yesPrice<PRICE_MIN)?"Price out of range":"Low activity/dead":"Unknown"}</td>
                             </tr>
                           );
                         })}
@@ -1457,7 +1707,7 @@ export default function App(){
 
         {/* RIGHT SIDEBAR */}
         <div style={{width:"200px",flexShrink:0,display:"flex",flexDirection:"column",borderLeft:"1px solid #141414",background:"#060606",overflow:"hidden"}}>
-          <div style={{flexShrink:0,padding:"4px 12px",fontSize:"9px",color:"#2a2a2a",letterSpacing:"1px",background:"#0d0d0d",borderBottom:"1px solid #1a1a1a"}}>LIVE STATS</div>
+          <div style={{flexShrink:0,padding:"4px 12px",fontSize:"9px",color:"#666",letterSpacing:"1px",background:"#0d0d0d",borderBottom:"1px solid #1a1a1a"}}>LIVE STATS</div>
           <div style={{flex:1,overflowY:"auto"}}>
             <SVal label="PORTFOLIO"   value={dollar(totalVal)}                           color={totalVal>=START_CASH?"#ccc":"#666"} sub="total" />
             <SVal label="CASH"        value={dollar(portfolio.cash)}                     color="#aaa" sub="available" />
@@ -1468,7 +1718,7 @@ export default function App(){
             <SVal label="WIN RATE"    value={winRate}                                   color="#888" sub={`${wins}W ${losses}L`} />
             <SVal label="PROF.FACTOR" value={pf>0?pf.toFixed(2)+"x":"--"}              color={pf>=1.5?"#4a8a4a":pf>=1?"#8a8a4a":"#666"} sub="avg win/loss" />
 
-            <div style={{padding:"3px 12px",fontSize:"9px",color:"#1e1e1e",letterSpacing:"1px",background:"#0a0a0a",borderTop:"1px solid #111",borderBottom:"1px solid #111"}}>BOT</div>
+            <div style={{padding:"3px 12px",fontSize:"9px",color:"#666",letterSpacing:"1px",background:"#0a0a0a",borderTop:"1px solid #111",borderBottom:"1px solid #111"}}>BOT</div>
             <SRow label="Scans"        value={stats.scans}/>
             <SRow label="Analyzed"     value={stats.analyzed}/>
             <SRow label="Executed"     value={stats.executed}/>
@@ -1483,15 +1733,15 @@ export default function App(){
             <SRow label="Max trade"    value={"$"+MAX_TRADE}/>
             <SRow label="Max open"     value={MAX_OPEN}/>
 
-            <div style={{padding:"3px 12px",fontSize:"9px",color:"#1e1e1e",letterSpacing:"1px",background:"#0a0a0a",borderTop:"1px solid #111",borderBottom:"1px solid #111"}}>BY TYPE</div>
+            <div style={{padding:"3px 12px",fontSize:"9px",color:"#666",letterSpacing:"1px",background:"#0a0a0a",borderTop:"1px solid #111",borderBottom:"1px solid #111"}}>BY TYPE</div>
             {["sports","macro","crypto","politics","finance","general"].map(t=><SRow key={t} label={t.toUpperCase()} value={stats.byType[t]||0} color={TT[t]}/>)}
 
-            <div style={{padding:"3px 12px",fontSize:"9px",color:"#1e1e1e",letterSpacing:"1px",background:"#0a0a0a",borderTop:"1px solid #111",borderBottom:"1px solid #111"}}>BY EDGE</div>
+            <div style={{padding:"3px 12px",fontSize:"9px",color:"#666",letterSpacing:"1px",background:"#0a0a0a",borderTop:"1px solid #111",borderBottom:"1px solid #111"}}>BY EDGE</div>
             <SRow label="News"         value={stats.byEdge.news||0}        color="#5a7a9a"/>
             <SRow label="Statistical"  value={stats.byEdge.statistical||0} color="#4a8a4a"/>
             <SRow label="Momentum"     value={stats.byEdge.momentum||0}    color="#9a9a4a"/>
 
-            <div style={{padding:"3px 12px",fontSize:"9px",color:"#1e1e1e",letterSpacing:"1px",background:"#0a0a0a",borderTop:"1px solid #111",borderBottom:"1px solid #111"}}>LIVE PRICES</div>
+            <div style={{padding:"3px 12px",fontSize:"9px",color:"#666",letterSpacing:"1px",background:"#0a0a0a",borderTop:"1px solid #111",borderBottom:"1px solid #111"}}>LIVE PRICES</div>
             <div style={{padding:"4px 6px"}}>
               {goodMkts.slice(0,22).map(m=>{
                 const mType=detectType(m.question);
@@ -1501,14 +1751,14 @@ export default function App(){
                   <div key={m.id} style={{padding:"4px 6px",marginBottom:"2px",borderLeft:`2px solid ${isHeld?"#2a5a2a":TC[mType]||"#1a1a1a"}`,background:isHeld?"#0a130a":"#0a0a0a"}}>
                     <div style={{color:isHeld?"#2e5e2e":"#2a2a2a",fontSize:"9px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.question.slice(0,28)}{isHeld?" ●":""}</div>
                     <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",marginTop:"1px"}}>
-                      <span style={{color:m.yesPrice>=0.30&&m.yesPrice<=0.70?"#555":"#3a3a3a"}}>{pct(m.yesPrice)}</span>
-                      <span style={{color:q>=60?"#2e4e2e":"#252525",fontSize:"8px"}}>{q}</span>
+                      <span style={{color:m.yesPrice>=0.30&&m.yesPrice<=0.70?"#aaa":"#777"}}>{pct(m.yesPrice)}</span>
+                      <span style={{color:q>=60?"#5a8a5a":"#666",fontSize:"8px"}}>{q}</span>
                       <span style={{color:m.oneDayChange>0?"#2e4e2e":m.oneDayChange<0?"#4e2e2e":"#1e1e1e"}}>{m.oneDayChange>0?"▲":m.oneDayChange<0?"▼":"─"}{(Math.abs(m.oneDayChange||0)*100).toFixed(1)}%</span>
                     </div>
                   </div>
                 );
               })}
-              {goodMkts.length===0&&<div style={{color:"#181818",padding:"8px",fontSize:"10px"}}>Run scan</div>}
+              {goodMkts.length===0&&<div style={{color:"#555",padding:"8px",fontSize:"10px"}}>Run scan</div>}
             </div>
           </div>
         </div>
@@ -1521,7 +1771,7 @@ export default function App(){
             <span key={l.id} style={{color:LOG_COLORS[l.type]||"#222",flexShrink:0}}>{l.ts} {l.msg}</span>
           ))}
         </div>
-        <div style={{flexShrink:0,padding:"0 14px",display:"flex",gap:"14px",fontSize:"10px",color:"#1e1e1e",borderLeft:"1px solid #161616"}}>
+        <div style={{flexShrink:0,padding:"0 14px",display:"flex",gap:"14px",fontSize:"10px",color:"#666",borderLeft:"1px solid #161616"}}>
           <span>Open:{open.length}/{MAX_OPEN}</span>
           <span style={{color:unrealPnl>=0?"#2a4a2a":"#4a2a2a"}}>P&L:{(unrealPnl>=0?"+":"-")+dollar(unrealPnl)}</span>
           <span>Cash:{dollar(portfolio.cash)}</span>
